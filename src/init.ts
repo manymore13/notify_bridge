@@ -122,26 +122,24 @@ export async function runInit() {
     await ch.disconnect();
   }
 
-  // ═══ Step 7: 保存配置 ═══
-  console.log("\n📂 保存配置");
-  const cfgDir = await ask("  位置 (1=全局 2=当前目录)", existing.im ? "1" : "1");
-  const cfgPath = cfgDir === "2"
-    ? join(process.cwd(), "config.json")
-    : join(homedir(), ".notify-bridge", "config.json");
+  // ═══ Step 7: 写入配置 (统一作用域) ═══
+  console.log("\n📂 配置写入位置:");
+  console.log("  1. 全局 (~/.notify-bridge + ~/.claude.json + ~/.claude/CLAUDE.md) → 回车");
+  console.log("  2. 当前项目 (./config.json + .mcp.json + CLAUDE.md)");
+  const scope = await ask("请选择", "1");
+  const isGlobal = scope !== "2";
+  const root = isGlobal ? join(homedir(), ".notify-bridge") : process.cwd();
 
-  saveJson(cfgPath, {
+  // config.json
+  saveJson(join(root, "config.json"), {
     im: { type: "feishu", feishu: { appId } },
     defaultTimeoutMs: existing.defaultTimeoutMs || 300000,
   });
-  console.log(`  ✅ ${cfgPath}`);
 
-  // ═══ Step 8: MCP 配置 ═══
-  console.log("\n🔌 MCP 配置");
-  const mcpChoice = await ask("  位置 (1=全局~/.claude.json 2=项目.mcp.json)", "1");
-  const mcpPath = mcpChoice === "2"
-    ? join(process.cwd(), ".mcp.json")
-    : join(homedir(), ".claude.json");
-
+  // MCP config
+  const mcpPath = isGlobal
+    ? join(homedir(), ".claude.json")
+    : join(process.cwd(), ".mcp.json");
   const mcp = loadJson(mcpPath) || {};
   mcp.mcpServers = mcp.mcpServers || {};
   mcp.mcpServers["notify-bridge"] = {
@@ -150,18 +148,12 @@ export async function runInit() {
     env: { FEISHU_APP_SECRET: appSecret },
   };
   saveJson(mcpPath, mcp);
-  console.log(`  ✅ ${mcpPath}`);
 
-  // ═══ Step 9: Agent 规则 ═══
-  console.log("\n📝 Agent 规则");
-  const ruleChoice = await ask("  注入规则? (1=是 2=否)", "1");
-  if (ruleChoice !== "2") {
-    const ruleGlobal = await ask("  位置 (1=全局~/.claude 2=当前项目)", "1");
-    const mdPath = ruleGlobal === "2"
-      ? join(process.cwd(), "CLAUDE.md")
-      : join(homedir(), ".claude", "CLAUDE.md");
-
-    const rule = `# notify-bridge 决策规则
+  // Agent rules
+  const mdPath = isGlobal
+    ? join(homedir(), ".claude", "CLAUDE.md")
+    : join(process.cwd(), "CLAUDE.md");
+  const rule = `# notify-bridge 决策规则
 
 ## 必须通过飞书通知的场景
 - 删除文件、git push/force push、git reset --hard 等不可逆操作
@@ -170,15 +162,15 @@ export async function runInit() {
 
 调用方式: request_decision("问题", ["选项1","选项2"]) 或 send_notification("通知内容")
 `;
-
-    const existingMd = loadJson(mdPath) ? readFileSync(mdPath, "utf-8") : "";
-    if (!existingMd.includes("notify-bridge")) {
-      writeFileSync(mdPath, (existingMd ? existingMd + "\n\n" : "") + rule);
-      console.log(`  ✅ ${mdPath}`);
-    } else {
-      console.log(`  ✅ 已存在: ${mdPath}`);
-    }
+  const existingMd = existsSync(mdPath) ? readFileSync(mdPath, "utf-8") : "";
+  if (!existingMd.includes("notify-bridge")) {
+    writeFileSync(mdPath, (existingMd ? existingMd + "\n\n" : "") + rule);
   }
+
+  console.log(`\n  写入完成 (${isGlobal ? "全局" : "当前项目"}):`);
+  console.log(`  ✅ ${join(root, "config.json")}`);
+  console.log(`  ✅ ${mcpPath}`);
+  console.log(`  ✅ ${mdPath}`);
 
   console.log("\n🎉 完成! 重启 Claude Code 后生效。\n");
   rl.close();
