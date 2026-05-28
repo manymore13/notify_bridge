@@ -191,11 +191,15 @@ export async function runInit() {
   saveMcpConfig(appSecret, isGlobal);
 
   // 6. Inject agent rules
-  console.log("\n📝 Agent 规则:");
-  console.log("  1. 轻量规则 (仅危险操作+通知) → 回车");
-  console.log("  2. 不注入规则");
+  console.log("\n📝 Agent 规则 (让 Agent 知道何时用飞书通知你):");
+  console.log("  1. 注入轻量规则 → 回车");
+  console.log("  2. 不注入");
   const rulesChoice = await ask("请选择", "1");
   if (rulesChoice !== "2") {
+    console.log("  规则写入位置:");
+    console.log("    1. 全局 (~/.claude/CLAUDE.md, 所有项目) → 回车");
+    console.log("    2. 当前项目 (./CLAUDE.md)");
+    const rulesGlobal = await ask("请选择", "1");
     const rulesContent = `# notify-bridge 决策规则
 
 ## 必须通过飞书通知的场景
@@ -205,7 +209,7 @@ export async function runInit() {
 
 调用方式: request_decision("问题", ["选项1","选项2"]) 或 send_notification("通知内容")
 `;
-    const claudeMdPath = isGlobal
+    const claudeMdPath = rulesGlobal !== "2"
       ? join(homedir(), ".claude", "CLAUDE.md")
       : join(process.cwd(), "CLAUDE.md");
     const mdDir = join(claudeMdPath, "..");
