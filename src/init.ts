@@ -67,21 +67,34 @@ export async function runInit() {
     if (appId) console.log(`  App ID: ${appId}`);
     else appId = await ask("  App ID", "");
 
-    if (appSecret) console.log("  App Secret: ***");
-    else appSecret = await ask("  App Secret: ");
+    if (!appSecret) {
+      appSecret = await ask("  App Secret", "");
+    } else {
+      const source = process.env.FEISHU_APP_SECRET ? "环境变量" : "已保存的配置";
+      console.log(`  App Secret: *** (${source})`);
+    }
 
-    // 3. Check permissions & events
+    // 3. Validate token — retry on failure, don't proceed until OK
+    let token = "";
     console.log("\n🔍 验证飞书连接...");
-    try {
-      const tokenRes = await axios.post(
-        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-        { app_id: appId, app_secret: appSecret }
-      );
-      if (tokenRes.data.code !== 0) {
-        console.log(`  ❌ 飞书返回错误: ${tokenRes.data.msg}`);
-      } else {
+    while (!token) {
+      try {
+        const tokenRes = await axios.post(
+          "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+          { app_id: appId, app_secret: appSecret }
+        );
+        if (tokenRes.data.code !== 0) {
+          console.log(`  ❌ ${tokenRes.data.msg}`);
+          appSecret = await ask("  重新输入 App Secret", "");
+          continue;
+        }
+        token = tokenRes.data.tenant_access_token;
         console.log("  ✅ 飞书连接成功!");
-        const token = tokenRes.data.tenant_access_token;
+      } catch (e: any) {
+        console.log(`  ❌ 网络错误: ${e.message}`);
+        appSecret = await ask("  重新输入 App Secret", "");
+      }
+    }
         const H = { Authorization: `Bearer ${token}` };
 
         // Permissions
@@ -142,10 +155,6 @@ export async function runInit() {
           });
           await channel.disconnect();
         }
-      }
-    } catch (e: any) {
-      console.log(`  ❌ 连接失败: ${e.message}`);
-    }
   } else {
     // Telegram
     const botToken = process.env.TELEGRAM_BOT_TOKEN || existingConfig?.im?.telegram?.botToken || await ask("  Bot Token: ");
