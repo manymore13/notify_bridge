@@ -10,7 +10,7 @@
 
 **核心场景**: Agent 在编码过程中需要人类确认（删除文件、架构选型、危险操作等），但人不在电脑旁——Agent 通过 IM 发消息到人类手机，人类回复后 Agent 自动继续执行。
 
-**版本**: 0.3.1-draft | **最后更新**: 2026-05-28 | **状态**: 二轮架构评审中 (代码待同步)
+**版本**: 0.4.0-draft | **最后更新**: 2026-05-28 | **状态**: 三轮架构评审中 (代码待同步)
 
 **通信模型**:
 
@@ -68,21 +68,63 @@ index.ts
 
 整个系统的核心，管理决策请求的生命周期。
 
-#### 数据结构
+#### 数据结构 & 存储抽象 (v0.4.0: IDecisionStore)
 
 ```typescript
-interface PendingDecision {
-  request: DecisionRequest;     // 决策请求的元数据
-  resolve: (answer: string) => void;  // Promise resolve
-  reject: (err: Error) => void;       // Promise reject
-  timer: ReturnType<typeof setTimeout>; // 超时定时器
+// 存储接口抽象 — 进程重启无感知切换
+interface IDecisionStore {
+  get(id: string): PendingDecision | undefined;
+  set(id: string, entry: PendingDecision): void;
+  delete(id: string): boolean;
+  getAll(): [string, PendingDecision][];
+  get size(): number;
+  clear(): void;
 }
 
-// 存储介质: 内存 Map<decisionId, PendingDecision>
-private pending = new Map<string, PendingDecision>();
+// 默认实现: 纯内存 (当前行为)
+class MemoryDecisionStore implements IDecisionStore {
+  private map = new Map<string, PendingDecision>();
+  // ... 标准 Map 包装
+}
+
+// 可选实现: 文件持久化 (抗崩溃/抗重启)
+class FileDecisionStore implements IDecisionStore {
+  private map = new Map<string, PendingDecision>();
+  private filePath: string;
+
+  constructor(path: string) {
+    this.filePath = path;
+    this.loadFromDisk();  // 重启时恢复状态
+  }
+
+  set(id: string, entry: PendingDecision): void {
+    this.map.set(id, entry);
+    this.flushToDisk();   // 每次写入同步到 pending.json
+  }
+  // ...
+}
 ```
 
-**关键属性**: 纯内存存储，进程重启后所有挂起决策丢失。
+**使用方式**:
+
+```typescript
+class NotifyBridge {
+  private store: IDecisionStore;
+
+  constructor(adapter: IMBotAdapter, store?: IDecisionStore) {
+    this.store = store || new MemoryDecisionStore();  // 默认内存
+  }
+}
+```
+
+**重启恢复语义**:
+- 进程重启 → `FileDecisionStore` 从 `pending.json` 恢复所有未超时决策
+- 已超时的决策 → 自动清理，不恢复（超时时间已过，无意义）
+- Promise 无法恢复（JS 限制）→ 恢复后立即 reject 并返回 `status: "recovered_after_restart"`
+- Agent 收到恢复后的错误 → 知道决策曾挂起但已失效 → 重新发起或继续
+
+**关键属性**: 默认 `MemoryDecisionStore` 保持现有行为。
+`FileDecisionStore` 为可选增强，通过配置 `BRIDGE_PERSISTENT_STORE=true` 启用。
 
 #### requestDecision() — 发起决策
 
@@ -214,48 +256,76 @@ async stop() {
 
 正确清理所有挂起的 Promise，避免僵尸 Promise。调用方会收到明确的 reject。
 
-#### checkDecisionRateLimit() / checkNotificationRateLimit() — 频控 (v0.3.1: backoff 防死锁)
+#### checkDecisionRateLimit() — 频控 (v0.4.0: 服务端不阻塞，返回 retry_after)
 
 ```typescript
-// 令牌桶: 决策 ≤5/分钟, 通知 ≤3/秒
+// 令牌桶: 决策 ≤5/分钟
 private decisionTimestamps: number[] = [];
-private notificationTimestamps: number[] = [];
 
-// v0.3.1: 触发频控时阻塞等待而非抛异常
-private async waitForDecisionSlot(): Promise<void> {
+private checkDecisionRateLimit(): { allowed: boolean; retryAfterMs?: number } {
   const now = Date.now();
   this.decisionTimestamps = this.decisionTimestamps.filter(t => now - t < 60000);
 
   if (this.decisionTimestamps.length >= 5) {
-    // 计算最早一个过期时间 → 精确等待
     const oldest = this.decisionTimestamps[0];
-    const waitMs = oldest + 60000 - now + 100; // +100ms buffer
-    console.warn(`[bridge] 频控: 等待 ${Math.round(waitMs / 1000)}s ...`);
-    await new Promise(r => setTimeout(r, waitMs));
+    const retryAfterMs = oldest + 60000 - now + 100;
+    return { allowed: false, retryAfterMs };
   }
 
-  this.decisionTimestamps.push(Date.now());
+  this.decisionTimestamps.push(now);
+  return { allowed: true };
 }
 ```
 
-**设计意图 (v0.3.1)**:
-- v0.2.0 的行为: 触发频控 → 抛异常 → Agent 收到 `isError` → 可能立即重试 → 死锁循环
-- v0.3.1 的行为: 触发频控 → **阻塞等待** → 等到有空位再放行 → Agent 无感知
-- 物理延迟强行拉低 Agent 的重试频率，避免 "错误→重试→错误" 死锁
-- `sendNotification` 同理，用 `waitForNotificationSlot()` 替代抛异常
+**设计意图 (v0.4.0 重大修正)**:
 
-**超时保护** (超时链路中的频控协同):
+v0.3.1 的致命问题: `await setTimeout()` 在 MCP Server 内部阻塞 → Node.js 单线程事件循环被挂起 → stdio 读取停止 → Claude 的 ping/其他工具调用全部积压 → 客户端超时 → 进程被 Kill。
+
+```
+错误链路: 频控触发 → setTimeout 60s → 事件循环阻塞 → stdio 卡死 → 进程被 Kill
+```
+
+v0.4.0 方案: **服务端立即返回，Agent 侧执行 sleep**。
 
 ```typescript
+// bridge.ts: 频控检查失败 → 立即 throw (不阻塞)
 async requestDecision(question, options, timeoutMs) {
-  await this.waitForDecisionSlot();  // ← 频控等待 (可能阻塞)
-
-  // 注意: 频控等待期间，用户的总体超时 timer 仍未启动
-  // 超时 timer 在下面创建 pending 后才开始计时
-  // 这样频控等待不会挤占用户的决策时间
-  // ...
+  const check = this.checkDecisionRateLimit();
+  if (!check.allowed) {
+    throw new RateLimitError(check.retryAfterMs!);
+  }
+  // ... 正常流程
 }
 ```
+
+```typescript
+// mcp-server.ts: 工具层捕获 RateLimitError → 返回 retry_after
+async ({ question, options, timeout_ms }) => {
+  try {
+    const answer = await bridge.requestDecision(...);
+    // ...
+  } catch (err) {
+    if (err instanceof RateLimitError) {
+      return {
+        content: [{ type: "text", text: JSON.stringify({
+          status: "rate_limited",
+          retry_after_ms: err.retryAfterMs,
+          hint: `频控保护，请在 ${Math.round(err.retryAfterMs / 1000)} 秒后重试。不要连续重试。`,
+        }) }],
+        isError: true,
+      };
+    }
+    // ... 其他错误处理
+  }
+}
+```
+
+**Agent System Prompt 规约** (在 AGENT_INSTRUCTIONS 中):
+
+> 收到 `status: "rate_limited"` 时，必须等待 `retry_after_ms` 毫秒后再重试。
+> 严禁忽略 retry_after_ms 直接重试。
+
+**关键**: MCP Server 自身不做任何阻塞等待，始终立即返回。由 Agent 在其运行周期内执行 sleep，释放 stdio 通道。
 
 #### getStatus() / getPendingDecisions()
 
@@ -288,6 +358,13 @@ async requestDecision(question, options, timeoutMs) {
   "raw_reply": "是",           // 人类的原始IM回复
   "source": "im",              // 标记来源为外部输入
   "warning": "..."             // 回复不在选项中时有警告
+}
+
+频控 (v0.4.0 新增):
+{
+  "status": "rate_limited",
+  "retry_after_ms": 45000,
+  "hint": "频控保护，请在 45 秒后重试。不要连续重试。"
 }
 
 超时:
@@ -383,6 +460,42 @@ function handleMessageEvent(data): void {
 - 环境变量 `FEISHU_ALLOWED_USER_IDS` 为空且未配置 `allowedUserIds` → 首次消息自动锁定（开发友好）
 - 环境变量 `FEISHU_ALLOWED_USER_IDS=ou_xxx,ou_yyy` → 仅白名单用户可触发决策
 - 锁定后，同事误发消息或被@机器人等情况不会导致 "决策发错人" 的安全事故
+
+**身份重置机制 (v0.4.0 新增)**:
+
+飞书 SDK `WSClient` 重连可能导致内部 session 重建；用户在企业内部身份变更（离职重入职）时 `open_id` 可能变化。如果 `lockedOpenId` 永久锁定在旧值上，合法用户将无法再触发决策。
+
+```typescript
+// 方案1: 进程重启重置 (最简单)
+// lockedOpenId 在内存中，进程重启自动清空 → 重新捕获
+
+// 方案2: MCP 工具显式重置
+// bridge_reset 工具: 清空 lockedOpenId + lockedUserId + pending
+// Agent 可调用或人类在飞书发 "!reset" 指令触发
+
+// 方案3: 健康自愈 (v0.4.0)
+// checkHealth() 连续 N 次发送失败 (code != 0, 如 user_not_found)
+// → 自动解锁 + 日志告警 + 等待重新绑定
+private consecutiveSendFailures = 0;
+private readonly MAX_SEND_FAILURES = 3;
+
+private async sendImMessage(...): Promise<void> {
+  const res = await axios.post(...);
+  if (res.data?.code === 0) {
+    this.consecutiveSendFailures = 0;
+  } else {
+    this.consecutiveSendFailures++;
+    if (this.consecutiveSendFailures >= this.MAX_SEND_FAILURES) {
+      console.error(`[feishu] 连续 ${this.MAX_SEND_FAILURES} 次发送失败，自动解锁身份`);
+      this.lockedOpenId = null;
+      this.capturedChatId = null;
+      this.consecutiveSendFailures = 0;
+    }
+  }
+}
+```
+
+**重置策略**: 进程重启自动重置 + 连续发送失败自动解锁 + 可选 MCP 工具手动重置。
 
 #### Token 管理 (v0.2.0 已修复缓存)
 
@@ -560,7 +673,67 @@ for (const update of res.data.result) {
 
 ---
 
-### 3.5 配置加载 (`config.ts`) (v0.3.0: 向上查找 + 全局回退)
+### 3.5 适配器生命周期 & 健康检查 (v0.4.0 新增)
+
+当前各适配器的初始化、Token 维护、连接维持逻辑各自为战，不利于扩展第三个 IM 平台。
+
+#### IMBotAdapter 接口规范化 (v0.4.0)
+
+```typescript
+interface HealthStatus {
+  status: "healthy" | "unhealthy" | "connecting";
+  reason?: string;
+  details?: Record<string, any>;
+}
+
+interface IMBotAdapter {
+  // ── 生命周期钩子 ──
+  init(): Promise<void>;                                     // 初始化: 连接、认证
+  start(callback: (r: DecisionResponse) => void): Promise<void>; // 开始监听
+  stop(): Promise<void>;                                     // 停止 & 清理
+
+  // ── 消息发送 ──
+  sendDecision(request: DecisionRequest): Promise<void>;
+  sendNotification(message: string): Promise<void>;
+
+  // ── 可观测性 (v0.4.0 新增) ──
+  checkHealth?(): Promise<HealthStatus>;   // 健康探针
+  isReady?(): boolean;                     // 是否有合法的发送目标
+  getStatus?(): Record<string, any>;       // 适配器特定状态
+}
+```
+
+#### bridge_status 改造
+
+当前 `bridge_status` 返回静态配置信息。v0.4.0 改造为调用适配器的 `checkHealth()` 做真正的健康探针：
+
+```typescript
+// mcp-server.ts: bridge_status 工具
+async () => {
+  const health = adapter.checkHealth
+    ? await adapter.checkHealth()
+    : { status: "healthy" as const, reason: "adapter does not implement checkHealth" };
+
+  return {
+    content: [{ type: "text", text: JSON.stringify({
+      im_type: config.im.type,
+      adapter_health: health,
+      ready: adapter.isReady?.() ?? true,
+      pending_count: bridge.getPendingDecisions().length,
+      store_type: store instanceof FileDecisionStore ? "file" : "memory",
+    }) }],
+  };
+};
+```
+
+**健康探针实现要求**:
+- 飞书: 检查 WebSocket 连接状态 (OPEN / CLOSED) + Token 是否有效 + lockedOpenId 是否设置
+- Telegram: 检查最近一次 `getUpdates` 是否成功 (30s 内有过成功响应)
+- 通用: 检查凭证是否存在 (`appSecret` / `botToken` 非空)
+
+---
+
+### 3.6 配置加载 (`config.ts`) (v0.3.0: 向上查找 + 全局回退)
 
 ```typescript
 // 查找优先级: 环境变量 > 当前目录 config.json > 向上递归查找 > ~/.notify-bridge/config.json > 默认值
@@ -599,7 +772,7 @@ telegram: {
 
 ---
 
-### 3.6 Setup 命令 (`setup.ts`)
+### 3.7 Setup 命令 (`setup.ts`)
 
 ```bash
 notify-bridge setup           # 项目级 → .claude/mcp.json
@@ -692,10 +865,19 @@ T+0.1s   adapter.sendDecision() 抛出异常
 | Telegram 群组成员劫持 | ✅ | from.id 校验 + lockedUserId + TELEGRAM_ALLOWED_USER_IDS |
 | Agent 频控死锁 | ✅ | throw → sleep/backoff 阻塞等待 |
 
+#### v0.4.0
+
+| 问题 | 状态 | 修复方式 |
+|------|------|---------|
+| backoff 阻塞导致 stdio 死锁 | ✅ | 服务端不阻塞，返回 `retry_after_ms`，Agent 侧 sleep |
+| lockedOpenId 永久失效 | ✅ | 连续发送失败自动解锁 + 进程重启重置 |
+| pending 内存无持久化 | ✅ | `IDecisionStore` 抽象 + `FileDecisionStore` 可选 |
+| 适配器无统一生命周期 | ✅ | `IMBotAdapter` 增加 `init()` + `checkHealth()` + `isReady()` |
+
 ### 5.3 仍待关注
 
 1. **伪造回复**: 飞书的 `open_id` 和 Telegram 的 `from.id` 可能被伪造（依赖 IM 平台自身的身份保证）。
-2. **内存持久化**: `pending` Map 纯内存，进程重启丢失所有挂起决策。
+2. **FileDecisionStore 恢复语义**: 重启后 Promise 无法恢复，需明确定义恢复行为（reject + 通知 Agent）。
 
 ---
 
@@ -781,20 +963,29 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | express 冗余依赖 | ✅ 已移除 |
 | config.json 绑定 cwd | ✅ 向上查找 + 全局回退 |
 
-### 7.3 v0.3.1 规划修复项
+### 7.3 v0.3.1 规划修复项 (全部完成)
 
 | 限制 | 状态 |
 |------|------|
-| 卡片点击绕过白名单 | ✅ handleCardAction 身份校验 |
-| Telegram 群组劫持 | ✅ from.id 校验 + 锁定 |
-| 频控死锁 (抛异常 → 重试) | ✅ backoff/sleep 替代 throw |
-| 文档 6.3 节逻辑冲突 | ✅ 修正为文本回复限制说明 |
+| 卡片点击绕过白名单 | ✅ |
+| Telegram 群组劫持 | ✅ |
+| 频控死锁 (抛异常 → 重试) | ✅ |
+| 文档 6.3 节逻辑冲突 | ✅ |
 
-### 7.4 仍存在的限制
+### 7.4 v0.4.0 规划修复项
+
+| 限制 | 状态 |
+|------|------|
+| backoff 阻塞导致 stdio 死锁 | ✅ 返回 retry_after_ms, Agent 侧 sleep |
+| lockedOpenId 永久失效 | ✅ 连续失败自动解锁 + 进程重启重置 |
+| pending 无持久化 | ✅ IDecisionStore 抽象 + FileDecisionStore |
+| 适配器无统一生命周期 | ✅ init/checkHealth/isReady 规范 |
+
+### 7.5 仍存在的限制
 
 | 限制 | 影响 | 优先级 |
 |------|------|--------|
-| 无持久化 | 进程重启丢失挂起决策 | 低 |
+| FileDecisionStore 恢复语义 | 重启后 Promise 不可恢复，需 reject + 通知 | 低 |
 | 文本回复无法关联 decisionId | 纯文本降级到选项匹配 + warning | 低 |
 | IM 身份依赖平台保证 | 理论上 open_id/from.id 可伪造 | 极低 |
 
@@ -838,13 +1029,15 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | 0.2.0 | 2026-05-28 | 审计修复: 卡片事件、Token缓存、防注入、频控、凭证强制env |
 | 0.3.0-draft | 2026-05-28 | 架构评审: 用户锁定+白名单、decisionId精确匹配、send超时保护、移除express、向上查找配置 |
 | 0.3.1-draft | 2026-05-28 | 二轮评审: 卡片点击安全校验、Telegram from.id验证、频控backoff防死锁、文本错位文档修正 |
+| 0.4.0-draft | 2026-05-28 | 三轮评审: 频控改为retry_after不阻塞stdio、lockedOpenId自愈重置、IDecisionStore持久化抽象、适配器生命周期规范化 |
 
 ## 11. 评审记录
 
 | 日期 | 轮次 | 结论 | 关键发现 |
 |------|------|------|---------|
 | 2026-05-28 | 一轮 | 不通过→修复后通过 | 5项: open_id覆盖、并发错位、发送死锁、express冗余、cwd绑定 |
-| 2026-05-28 | 二轮 | Conditionally Approved → 通过 | 4项: 卡片点击绕过白名单、文本错位文档冲突、Telegram群组劫持神话、频控死锁 |
+| 2026-05-28 | 二轮 | Conditionally Approved → 通过 | 4项: 卡片点击绕过白名单、文本错位文档冲突、Telegram群组劫持、频控死锁 |
+| 2026-05-28 | 三轮 | Conditional Disapproval → 待修复 | 4项: backoff阻塞stdio致命Bug、lockedOpenId假死、无持久化抽象、适配器无生命周期 |
 
 ## 12. 总结
 
