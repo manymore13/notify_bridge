@@ -10,7 +10,7 @@
 
 **核心场景**: Agent 在编码过程中需要人类确认（删除文件、架构选型、危险操作等），但人不在电脑旁——Agent 通过 IM 发消息到人类手机，人类回复后 Agent 自动继续执行。
 
-**版本**: 0.5.0-draft | **最后更新**: 2026-05-28 | **状态**: 四轮架构评审 (代码待同步)
+**版本**: 0.6.0-draft | **最后更新**: 2026-05-28 | **状态**: 五轮架构评审 (代码待同步)
 
 **通信模型**:
 
@@ -71,18 +71,18 @@ index.ts
 #### 数据结构 & 存储抽象 (v0.4.0: IDecisionStore)
 
 ```typescript
-// 存储接口抽象 (v0.5.0: 增加事件钩子)
-interface IDecisionStore {
-  get(id: string): PendingDecision | undefined;
-  set(id: string, entry: PendingDecision): void;
-  delete(id: string): boolean;
-  getAll(): [string, PendingDecision][];
-  get size(): number;
-  clear(): void;
+// 存储接口抽象 (v0.6.0: 全面异步化 + 事件钩子)
+interface IDecisionStore extends EventEmitter {
+  get(id: string): Promise<PendingDecision | undefined>;
+  set(id: string, entry: PendingDecision): Promise<void>;
+  delete(id: string): Promise<boolean>;
+  getAll(): Promise<[string, PendingDecision][]>;
+  getSize(): Promise<number>;
+  clear(): Promise<void>;
 
-  // v0.5.0 新增: 事件钩子
-  on(event: "recovered", callback: (entry: PendingDecision) => void): void;
-  on(event: "expired",  callback: (entry: PendingDecision) => void): void;
+  // 事件钩子
+  on(event: "recovered", callback: (entry: PendingDecision) => void): this;
+  on(event: "expired",  callback: (entry: PendingDecision) => void): this;
 }
 
 // 默认实现: 纯内存 (当前行为)
@@ -91,21 +91,63 @@ class MemoryDecisionStore implements IDecisionStore {
   // ... 标准 Map 包装
 }
 
-// 可选实现: 文件持久化 (抗崩溃/抗重启)
-class FileDecisionStore implements IDecisionStore {
+// 可选实现: 文件持久化 (v0.6.0: 异步 + 防并发写入锁)
+class FileDecisionStore extends EventEmitter implements IDecisionStore {
   private map = new Map<string, PendingDecision>();
   private filePath: string;
+  private isFlushing = false;
+  private needsFlush = false;
 
   constructor(path: string) {
+    super();
     this.filePath = path;
-    this.loadFromDisk();  // 重启时恢复状态
   }
 
-  set(id: string, entry: PendingDecision): void {
-    this.map.set(id, entry);
-    this.flushToDisk();   // 每次写入同步到 pending.json
+  // 异步加载 + 恢复逻辑
+  async loadFromDisk(): Promise<void> {
+    try {
+      const raw = JSON.parse(await fs.readFile(this.filePath, "utf-8"));
+      const now = Date.now();
+      for (const item of raw) {
+        const remaining = item.timeoutMs - (now - item.createdAt);
+        if (remaining <= 0) { this.emit("expired", item); continue; }
+        const entry = this.rebuildEntry(item);
+        this.map.set(item.id, entry);
+        this.emit("recovered", entry);
+      }
+      await this.flushToDisk();
+    } catch (err: any) {
+      if (err.code !== "ENOENT") console.error(`[Store] 加载失败: ${err.message}`);
+    }
   }
-  // ...
+
+  // 防并发冲突的异步写锁 (v0.6.0)
+  private async flushToDisk(): Promise<void> {
+    if (this.isFlushing) { this.needsFlush = true; return; }
+    this.isFlushing = true;
+    try {
+      const data = Array.from(this.map.values()).map(e => ({
+        id: e.request.id, createdAt: e.request.createdAt,
+        timeoutMs: e.request.timeoutMs, question: e.request.question,
+      }));
+      await fs.writeFile(this.filePath, JSON.stringify(data, null, 2), "utf-8");
+    } finally {
+      this.isFlushing = false;
+      if (this.needsFlush) { this.needsFlush = false; await this.flushToDisk(); }
+    }
+  }
+
+  async set(id: string, entry: PendingDecision): Promise<void> {
+    this.map.set(id, entry); await this.flushToDisk();
+  }
+  async delete(id: string): Promise<boolean> {
+    const ok = this.map.delete(id); if (ok) await this.flushToDisk(); return ok;
+  }
+  async get(id: string) { return this.map.get(id); }
+  async getAll() { return Array.from(this.map.entries()); }
+  async getSize() { return this.map.size; }
+  async clear() { this.map.clear(); await this.flushToDisk(); }
+  private rebuildEntry(item: any): PendingDecision { /* ... */ }
 }
 ```
 
@@ -248,35 +290,61 @@ async start() {
 
 **设计意图**: 步骤 6 在步骤 7 之前执行，确保 `getPendingDecisions()` 调用方无需等待微任务即可看到挂起决策。
 
-**sendDecision 发送超时保护 (v0.3.0 新增)**:
+**sendDecision 发送超时保护 (v0.6.0: AbortController 防 Unhandled Rejection)**:
+
+v0.5.0 致命缺陷: `Promise.race` 超时后 `sendDecision` 的原生 Promise 仍在后台运行。
+若它在超时后发生 `reject`，由于外层 catch 已结束 → `UnhandledPromiseRejection` → **进程崩溃**。
 
 ```typescript
-// sendDecision 必须设置硬超时 (3-5s)，防止 IM 服务商网关卡死
-// 导致 MCP 线程被永久阻塞
 const SEND_TIMEOUT_MS = 5000;
 
 async requestDecision(question, options, timeoutMs) {
-  // ...
+  // ... 前置处理
+  const abortController = new AbortController();
+
   try {
     await Promise.race([
-      this.adapter.sendDecision(request),
+      // 传递 AbortSignal 到底层 HTTP 请求，真正中止网络连接
+      this.adapter.sendDecision(request, { signal: abortController.signal })
+        .catch(err => {
+          if (err.name === "AbortError") return;  // ← 吞掉中止错误
+          throw err;
+        }),
       new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("IM发送超时")), SEND_TIMEOUT_MS)
+        setTimeout(() => {
+          abortController.abort();  // 触发真正的网络请求取消
+          reject(new Error("IM发送超时 (网关无响应)"));
+        }, SEND_TIMEOUT_MS)
       ),
     ]);
+
+    // 发送成功 → 注册业务超时 timer
+    const timer = setTimeout(async () => {
+      await this.store.delete(id);
+      rejectFn(new Error(`决策超时 (${timeoutMs}ms)`));
+    }, timeoutMs);
+    entry.timer = timer;
+
   } catch (err) {
-    clearTimeout(timer);
-    this.pending.delete(id);
+    clearTimeout(entry.timer);
+    await this.store.delete(id);
     throw err;
   }
-  return promise;
+
+  return decisionPromise;
 }
 ```
 
+**关键修复**:
+1. `AbortController.signal` 传递给适配器的 `sendDecision` → axios `{ signal }` → 真正中止 HTTP 连接
+2. `.catch(err => { if (err.name === "AbortError") return; throw err; })` → 吞掉预期内的中止错误
+3. 超时后不会产生 `UnhandledPromiseRejection`
+
+**注意**: 适配器接口需增加可选 `options?: { signal?: AbortSignal }` 参数。
+
 **⚠️ 残留风险**:
 - 发送超时后 pending 条目已清理，但 IM 消息可能已送达（网络延迟导致 race condition）。
-  用户回复时 pending.size === 0，回复被静默丢弃。
-  **缓解**: 超时返回后 Agent 会在终端重新展示问题，不会永久丢失上下文。
+  **缓解**: 超时后 Agent 在终端重新展示问题。
 
 #### handleReply() — 回复匹配算法 (v0.3.0: decisionId 精确关联)
 
@@ -610,11 +678,53 @@ private async sendImMessage(...): Promise<void> {
 }
 ```
 
+**安全状态机 (v0.6.0: PENDING_REBIND 防二次劫持)**:
+
+v0.5.0 致命缺陷: 自动解锁后回退到 `UNBOUND` 状态 → 任何同事发消息即可劫持身份。
+
+```
+状态转换图:
+
+  UNBOUND ──首次合法消息──► BOUND_LOCKED ──连续3次身份失效错误码──► PENDING_REBIND
+      ▲                         │                                        │
+      │                         │ 其余错误码                              │
+      │                         ▼ (不转换)                               │
+      └──────────────────── 仅进程重启或管理员手动指令 ──────────────────┘
+      (任何人发消息无法从 PENDING_REBIND 回到 UNBOUND!)
+```
+
+```typescript
+enum AuthState {
+  UNBOUND = 0,         // 初始未绑定
+  BOUND_LOCKED = 1,    // 已锁定有效用户
+  PENDING_REBIND = 2,  // 身份失效，等待安全重绑 (拒绝任何新用户消息)
+}
+
+private authState: AuthState = AuthState.UNBOUND;
+
+// 身份失效时：
+if (this.identityFailures >= 3) {
+  console.error(`[feishu] 🚨 身份彻底失效，进入 PENDING_REBIND 锁定状态`);
+  this.authState = AuthState.PENDING_REBIND;  // ← 不回退到 UNBOUND!
+  this.lockedOpenId = null;
+  this.identityFailures = 0;
+}
+
+// 处理入站事件时：
+function handleIncomingEvent(operatorId: string): void {
+  if (this.authState === AuthState.PENDING_REBIND) {
+    console.warn(`[feishu] PENDING_REBIND: 拒绝 ${operatorId} 的请求。请重启服务或执行 bridge_reset。`);
+    return;  // ← 任何人的消息都被拒绝，不捕获不锁定!
+  }
+  // ... 正常处理
+}
+```
+
 **重置策略**:
-- 进程重启 → 自动重置 (内存清空)
-- 身份失效错误码 × 3 → 自动解锁 (仅 user_not_found 等特定码)
-- 网络错误 / 限流 (429) / 超时 → 仅告警，不解锁
-- 可选 `bridge_reset` MCP 工具 → 手动重置
+- 进程重启 → `UNBOUND` (重新捕获)
+- 身份失效错误码 × 3 → `PENDING_REBIND` (拒绝所有人，等待管理员介入)
+- 网络错误 / 限流 / 超时 → 不转换状态
+- `bridge_reset` MCP 工具 → 回到 `UNBOUND` (需在本地终端确认)
 
 #### Token 管理 (v0.2.0 已修复缓存)
 
@@ -733,13 +843,38 @@ async stop() {
 
 使用 Telegram Bot API 的 **Long Polling** (`getUpdates`) 接收消息，不需要公网 URL。
 
+**v0.6.0 致命修复: `start()` 不再阻塞 MCP 初始化**:
+
 ```typescript
-// 长轮询循环:
-while (this.polling) {
-  const res = await axios.get(`${apiBase}/getUpdates`, {
-    params: { offset: lastUpdateId + 1, timeout: 30 }
-  });
-  // 处理更新...
+// v0.5.0 (旧): start() 内部 await 死循环 → MCP 初始化永久挂起
+async start(cb) {
+  while (this.polling) { await getUpdates(); }  // ← 永不返回!
+}
+
+// v0.6.0 (新): start() 立即返回, 循环在后台 fire-and-forget
+async start(callback) {
+  this.onReplyCallback = callback;
+  if (this.polling) return;
+  this.polling = true;
+  this.pollUpdates();  // 不 await, 后台运行
+  return Promise.resolve();
+}
+
+async pollUpdates() {
+  while (this.polling) {
+    try {
+      const res = await axios.get(`${apiBase}/getUpdates`, {
+        params: { offset: this.lastUpdateId + 1, timeout: 30 }
+      });
+      for (const update of res.data.result) {
+        this.lastUpdateId = update.update_id;
+        this.handleUpdate(update);
+      }
+    } catch (err) {
+      console.warn(`[telegram] 轮询异常: ${err.message}`);
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
 }
 ```
 
@@ -832,7 +967,7 @@ v0.5.0 严格规定单一职责:
 | 阶段 | 职责 | 飞书 | Telegram |
 |------|------|------|----------|
 | `init()` | 建立连接 & 鉴权 | `new WSClient` + 等待 `open` | `getMe()` 探活 |
-| `start(cb)` | 使能监听，分发事件 | 存储 cb (连接已就绪) | `while(polling)` 循环 |
+| `start(cb)` | 使能监听，分发事件 (立即返回) | 存储 cb (连接已就绪) | `pollUpdates()` fire-and-forget |
 | `checkHealth()` | 健康探针 | WS === OPEN && Token 有效 | 30s内 getUpdates 成功 |
 
 **NotiftyBridge 启动流程规范化**:
@@ -1188,6 +1323,7 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | 0.3.1-draft | 2026-05-28 | 二轮评审: 卡片点击安全校验、Telegram from.id验证、频控backoff防死锁、文本错位文档修正 |
 | 0.4.0-draft | 2026-05-28 | 三轮评审: 频控改为retry_after不阻塞stdio、lockedOpenId自愈重置、IDecisionStore持久化抽象、适配器生命周期规范化 |
 | 0.5.0-draft | 2026-05-28 | 四轮评审: 重启Timer重绑定、自愈精准错误码防误杀、IDecisionStore事件驱动、init/start职责分离 |
+| 0.6.0-draft | 2026-05-28 | 五轮评审: Telegram start()去阻塞、AbortController防崩溃、Store异步化+写锁、PENDING_REBIND安全状态机 |
 
 ## 11. 评审记录
 
@@ -1196,7 +1332,8 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | 2026-05-28 | 一轮 | 不通过→修复后通过 | 5项: open_id覆盖、并发错位、发送死锁、express冗余、cwd绑定 |
 | 2026-05-28 | 二轮 | Conditionally Approved → 通过 | 4项: 卡片点击绕过白名单、文本错位文档冲突、Telegram群组劫持、频控死锁 |
 | 2026-05-28 | 三轮 | Conditional Disapproval → 待修复 | 4项: backoff阻塞stdio致命Bug、lockedOpenId假死、无持久化抽象、适配器无生命周期 |
-| 2026-05-28 | 四轮 | Pass with Revision → 小修后发布 | 4项: 重启Timer丢失僵尸决策、自愈误杀、存储无事件通知、init/start职责混淆 |
+| 2026-05-28 | 四轮 | Pass with Revision → 小修后发布 | 4项: 重启Timer丢失、自愈误杀、存储无事件、init/start混淆 |
+| 2026-05-28 | 五轮 | Pass with Revision → 趋于完美 | 4项: Telegram死循环挂起、UnhandledRejection崩溃、Store同步I/O、解锁二次劫持 |
 
 ## 12. 总结
 
