@@ -42,10 +42,15 @@ export class FeishuAdapter implements IMBotAdapter {
 
   async start(callback: (r: DecisionResponse) => Promise<void>): Promise<void> {
     this.onReply = callback;
-    this.channel = createLarkChannel({ appId: this.cfg.appId, appSecret: this.cfg.appSecret });
+    this.channel = createLarkChannel({
+      appId: this.cfg.appId,
+      appSecret: this.cfg.appSecret,
+      includeRawEvent: true,
+      loggerLevel: 1, // info
+    });
     this.channel.on({
       message: (msg) => this.handleMessage(msg),
-      cardAction: (evt) => this.handleCardAction(evt),
+      cardAction: (evt) => { this.handleCardAction(evt); },
     });
     await this.channel.connect();
     console.error(`[feishu] 长连接已建立 (Channel API + CardKit 2.0)`);
@@ -181,6 +186,7 @@ export class FeishuAdapter implements IMBotAdapter {
       const decisionId = value.id || "";
 
       console.error(`[feishu] 🃏 卡片按钮: "${answer}" (${decisionId.slice(0, 8)})`);
+      // 立即 resolve, 不 await, 让 SDK 快速响应飞书 (3秒限制)
       this.onReply?.({ decisionId, answer, respondedAt: Date.now() })
         ?.catch((err) => console.error(`[feishu] onReply 异常: ${err.message}`));
     } catch (err: any) {
