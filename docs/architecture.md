@@ -10,7 +10,7 @@
 
 **核心场景**: Agent 在编码过程中需要人类确认（删除文件、架构选型、危险操作等），但人不在电脑旁——Agent 通过 IM 发消息到人类手机，人类回复后 Agent 自动继续执行。
 
-**版本**: 0.6.0-draft | **最后更新**: 2026-05-28 | **状态**: 五轮架构评审 (代码待同步)
+**版本**: 0.7.0 | **最后更新**: 2026-05-28 | **状态**: 已封版 (Approved for Production)
 
 **通信模型**:
 
@@ -414,20 +414,21 @@ function handleCardAction(data): void {
 
 **最小惊讶原则**: 卡片按钮强制精确关联；文本回复作为备用通道，降级到选项匹配 (带 warning 标记)。
 
-#### stop() — 关闭
+#### stop() — 关闭 (v0.7.0: 适配 IDecisionStore 异步 API)
 
 ```typescript
-async stop() {
-  for (const [, pending] of this.pending) {
+async stop(): Promise<void> {
+  const allPending = await this.store.getAll();
+  for (const [, pending] of allPending) {
     clearTimeout(pending.timer);
     pending.reject(new Error("Bridge shutting down"));
   }
-  this.pending.clear();
+  await this.store.clear();
   await this.adapter.stop();
 }
 ```
 
-正确清理所有挂起的 Promise，避免僵尸 Promise。调用方会收到明确的 reject。
+遍历存储中的所有挂起决策 → 清除定时器 → reject Promise → 清空存储 → 关闭适配器。
 
 #### checkDecisionRateLimit() — 频控 (v0.4.0: 服务端不阻塞，返回 retry_after)
 
@@ -860,21 +861,31 @@ async start(callback) {
   return Promise.resolve();
 }
 
+private pollAbortController = new AbortController();
+
 async pollUpdates() {
   while (this.polling) {
     try {
       const res = await axios.get(`${apiBase}/getUpdates`, {
-        params: { offset: this.lastUpdateId + 1, timeout: 30 }
+        params: { offset: this.lastUpdateId + 1, timeout: 30 },
+        signal: this.pollAbortController.signal,  // ← 可被 stop() 中断
       });
       for (const update of res.data.result) {
         this.lastUpdateId = update.update_id;
         this.handleUpdate(update);
       }
-    } catch (err) {
+    } catch (err: any) {
+      if (err.name === "AbortError") return;  // ← stop() 触发的预期中断
       console.warn(`[telegram] 轮询异常: ${err.message}`);
       await new Promise(r => setTimeout(r, 2000));
     }
   }
+}
+
+async stop(): Promise<void> {
+  this.polling = false;
+  this.pollAbortController.abort();  // ← 立即杀死进行中的 30s 长轮询
+  return Promise.resolve();
 }
 ```
 
@@ -1324,6 +1335,7 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | 0.4.0-draft | 2026-05-28 | 三轮评审: 频控改为retry_after不阻塞stdio、lockedOpenId自愈重置、IDecisionStore持久化抽象、适配器生命周期规范化 |
 | 0.5.0-draft | 2026-05-28 | 四轮评审: 重启Timer重绑定、自愈精准错误码防误杀、IDecisionStore事件驱动、init/start职责分离 |
 | 0.6.0-draft | 2026-05-28 | 五轮评审: Telegram start()去阻塞、AbortController防崩溃、Store异步化+写锁、PENDING_REBIND安全状态机 |
+| 0.7.0 | 2026-05-28 | 封版: stop()适配IDecisionStore异步API、Telegram轮询AbortController优雅退出 |
 
 ## 11. 评审记录
 
@@ -1333,7 +1345,8 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | 2026-05-28 | 二轮 | Conditionally Approved → 通过 | 4项: 卡片点击绕过白名单、文本错位文档冲突、Telegram群组劫持、频控死锁 |
 | 2026-05-28 | 三轮 | Conditional Disapproval → 待修复 | 4项: backoff阻塞stdio致命Bug、lockedOpenId假死、无持久化抽象、适配器无生命周期 |
 | 2026-05-28 | 四轮 | Pass with Revision → 小修后发布 | 4项: 重启Timer丢失、自愈误杀、存储无事件、init/start混淆 |
-| 2026-05-28 | 五轮 | Pass with Revision → 趋于完美 | 4项: Telegram死循环挂起、UnhandledRejection崩溃、Store同步I/O、解锁二次劫持 |
+| 2026-05-28 | 五轮 | Pass with Revision → 趋于完美 | 4项: Telegram死循环、UnhandledRejection、Store同步I/O、解锁劫持 |
+| 2026-05-28 | 终审 | Approved for Production ✅ | 2项微瑕: stop()旧API残留、Telegram轮询非优雅退出 |
 
 ## 12. 总结
 
