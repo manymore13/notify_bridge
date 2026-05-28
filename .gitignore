@@ -4,4 +4,6 @@ config.json
 .env
 *.log
 .idea/
+.claude/
 feishu-claude-code-bridge/
+

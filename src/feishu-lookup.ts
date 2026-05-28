@@ -2,7 +2,7 @@
 
 import axios from "axios";
 
-const APP_ID = process.env.FEISHU_APP_ID || "";
+const APP_ID = process.env.FEISHU_APP_ID || "YOUR_APP_ID";
 const APP_SECRET = process.env.FEISHU_APP_SECRET || "";
 
 async function getToken(): Promise<string> {

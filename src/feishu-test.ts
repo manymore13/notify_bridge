@@ -1,7 +1,7 @@
 import axios from "axios";
 
-const APP_ID = "cli_aa9fe0750a7c9bc4";
-const APP_SECRET = "BXc1QoE1YGEvNQ2TfYMDGh55yVXtEX4Y";
+const APP_ID = process.env.FEISHU_APP_ID || "YOUR_APP_ID";
+const APP_SECRET = process.env.FEISHU_APP_SECRET || "YOUR_APP_SECRET";
 
 async function main() {
   console.log("=== 飞书 API 连通性测试 ===\n");

@@ -1,6 +1,6 @@
 import * as Lark from "@larksuiteoapi/node-sdk";
 
-const APP_ID = "cli_aa9fe0750a7c9bc4";
+const APP_ID = process.env.FEISHU_APP_ID || "YOUR_APP_ID";
 const APP_SECRET = process.env.FEISHU_APP_SECRET || "";
 
 if (!APP_SECRET) {
