@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { NotifyBridge, MemoryDecisionStore } from "./bridge.js";
-import { MockAdapter } from "./adapters/mock.js";
+import { NotifyBridge, MemoryDecisionStore } from "../src/bridge.js";
+import { MockAdapter } from "../src/adapters/mock.js";
 
 let passed = 0;
 let failed = 0;

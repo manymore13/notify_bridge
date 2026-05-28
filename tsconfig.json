@@ -13,5 +13,5 @@
     "resolveJsonModule": true
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "src/test.ts", "src/integration-test.ts", "src/e2e-test.ts", "src/sdk-test.ts", "src/feishu-test.ts", "src/feishu-lookup.ts", "src/find-openid.ts"]
+  "exclude": ["node_modules", "dist", "tests"]
 }

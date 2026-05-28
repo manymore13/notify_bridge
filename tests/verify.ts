@@ -1,5 +1,5 @@
-import { createAdapter } from "./adapters/index.js";
-import { NotifyBridge, MemoryDecisionStore } from "./bridge.js";
+import { createAdapter } from "../src/adapters/index.js";
+import { NotifyBridge, MemoryDecisionStore } from "../src/bridge.js";
 
 async function main() {
   console.log("=== notify-bridge 启动验证 ===\n");

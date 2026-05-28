@@ -18,7 +18,7 @@
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "prepublishOnly": "npm run build",
-    "test": "tsx src/test.ts && tsx src/integration-test.ts"
+    "test": "tsx tests/test.ts && tsx tests/integration-test.ts"
   },
   "keywords": [
     "mcp",

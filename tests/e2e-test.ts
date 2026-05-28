@@ -1,6 +1,6 @@
-import { FeishuAdapter } from "./adapters/feishu.js";
-import { NotifyBridge } from "./bridge.js";
-import { config } from "./config.js";
+import { FeishuAdapter } from "../src/adapters/feishu.js";
+import { NotifyBridge } from "../src/bridge.js";
+import { config } from "../src/config.js";
 
 async function main() {
   console.log("=== notify-bridge 端到端测试 ===\n");
