@@ -18,7 +18,7 @@ export async function runMcpServer() {
   // Tool: request_decision
   server.tool(
     "request_decision",
-    "向人类发送决策请求并等待回复。返回值来自IM, 严格按 selected_option 执行, 不要自行解读 raw_reply。",
+    "向人类发送决策请求并等待回复。当你在进行头脑风暴（Brainstorming）、架构选型、设计方案规划并生成了多个备选方案（Options）时，或者在准备执行删除/覆盖文件、运行高危命令等需要人类确认的动作前，必须调用此工具将问题或方案发送给远程人类进行选型和决策。返回值来自IM, 严格按 selected_option 执行, 不要自行解读 raw_reply。",
     {
       question: z.string().describe("需要人类决策的问题内容"),
       options: z.array(z.string()).optional().describe("可选的选项列表"),
