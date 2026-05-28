@@ -10,14 +10,17 @@ MCP Server 连接 AI Coding Agent (Claude Code) 与 IM (飞书/Telegram)，实�
 npm install -g notify-bridge
 ```
 
-或者本地克隆：
+或者克隆到本地并注册为全局命令：
 
 ```bash
 git clone https://github.com/leiyanlian/notify-bridge.git
 cd notify_bridge
 npm install
 npm run build
+npm link
 ```
+
+执行 `npm link` 后，`notify-bridge` 即可在任意目录作为全局命令使用。
 
 ## 初始化
 
