@@ -194,10 +194,10 @@ export class FeishuAdapter implements IMBotAdapter {
       const operatorOpenId = evt.operator?.openId || evt.operator?.open_id;
       if (!this.gateIncoming(operatorOpenId)) return;
 
-      // SDK 已自动解析 action.value 为对象 (非字符串!)
-      const value = evt.action?.value;
-      const answer = (typeof value === "object" && value?.option) ? value.option : String(value ?? "");
-      const decisionId = (typeof value === "object" && value?.id) ? value.id : "";
+      // SDK 已解析 action.value 为 {id, option} 对象 (卡片传了对象value)
+      const value = evt.action?.value || {};
+      const answer = value.option || "";
+      const decisionId = value.id || "";
 
       console.error(`[feishu] 🃏 卡片按钮: "${answer}" (decisionId: ${decisionId.slice(0, 8)})`);
       this.onReply?.({ decisionId, answer, respondedAt: Date.now() })
@@ -291,7 +291,7 @@ export class FeishuAdapter implements IMBotAdapter {
         actions: request.options.map((opt, i) => ({
           tag: "button",
           text: { tag: "lark_md" as const, content: opt },
-          value: JSON.stringify({ id: request.id, option: opt }),
+          value: { id: request.id, option: opt },  // value 传对象, SDK 自动处理
           type: (i === 0 ? "primary" : "default") as "primary" | "default",
         })),
       });
