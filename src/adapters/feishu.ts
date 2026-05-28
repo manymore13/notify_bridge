@@ -1,7 +1,13 @@
 import axios from "axios";
 import * as Lark from "@larksuiteoapi/node-sdk";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import type { IMBotAdapter, DecisionRequest, DecisionResponse, HealthStatus, SendOptions } from "./types.js";
 import type { FeishuConfig } from "../config.js";
+
+const BINDING_DIR = join(homedir(), ".notify-bridge");
+const BINDING_PATH = join(BINDING_DIR, "binding.json");
 
 enum AuthState {
   UNBOUND = 0,
@@ -46,6 +52,7 @@ export class FeishuAdapter implements IMBotAdapter {
 
   async init(): Promise<void> {
     this.stopped = false;
+    this.loadBinding();
     await this.getAccessToken();
   }
 
@@ -117,6 +124,37 @@ export class FeishuAdapter implements IMBotAdapter {
     };
   }
 
+  // ── 持久化绑定 ──
+
+  private loadBinding(): void {
+    try {
+      if (existsSync(BINDING_PATH)) {
+        const data = JSON.parse(readFileSync(BINDING_PATH, "utf-8"));
+        if (data.openId) {
+          this.lockedOpenId = data.openId;
+          this.capturedChatId = data.chatId || null;
+          this.authState = AuthState.BOUND_LOCKED;
+          console.error(`[feishu] 📂 加载持久化绑定: ${data.openId}`);
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
+  private saveBinding(): void {
+    try {
+      if (!existsSync(BINDING_DIR)) mkdirSync(BINDING_DIR, { recursive: true });
+      writeFileSync(BINDING_PATH, JSON.stringify({
+        openId: this.lockedOpenId,
+        chatId: this.capturedChatId,
+        updatedAt: new Date().toISOString(),
+      }, null, 2));
+    } catch { /* ignore */ }
+  }
+
+  private clearBinding(): void {
+    try { if (existsSync(BINDING_PATH)) writeFileSync(BINDING_PATH, "{}"); } catch {}
+  }
+
   // ── 安全门禁 ──
 
   private gateIncoming(operatorOpenId: string | undefined): boolean {
@@ -125,7 +163,7 @@ export class FeishuAdapter implements IMBotAdapter {
       console.warn(`[feishu] PENDING_REBIND: 拒绝事件, 需管理员重置`);
       return false;
     }
-    if (!operatorOpenId) return true; // 无法提取身份, 降级放行
+    if (!operatorOpenId) return true;
 
     // 白名单检查
     if (this.allowedUsers.size > 0 && !this.allowedUsers.has(operatorOpenId)) {
@@ -137,10 +175,11 @@ export class FeishuAdapter implements IMBotAdapter {
       console.warn(`[feishu] 非锁定用户 ${operatorOpenId} 已丢弃`);
       return false;
     }
-    // 首次捕获
+    // 首次捕获 → 持久化
     if (!this.lockedOpenId) {
       this.lockedOpenId = operatorOpenId;
       this.authState = AuthState.BOUND_LOCKED;
+      this.saveBinding();
       console.error(`[feishu] 🔒 锁定用户: ${operatorOpenId}`);
     }
     return true;
@@ -154,7 +193,10 @@ export class FeishuAdapter implements IMBotAdapter {
       const operatorOpenId = event.sender?.sender_id?.open_id;
       if (!this.gateIncoming(operatorOpenId)) return;
 
-      if (event.message?.chat_id) this.capturedChatId = event.message.chat_id;
+      if (event.message?.chat_id && event.message.chat_id !== this.capturedChatId) {
+        this.capturedChatId = event.message.chat_id;
+        this.saveBinding();
+      }
 
       if (!event.message?.content) return;
       const msgContent = JSON.parse(event.message.content);
@@ -230,6 +272,7 @@ export class FeishuAdapter implements IMBotAdapter {
           this.lockedOpenId = null;
           this.capturedChatId = null;
           this.identityFailures = 0;
+          this.clearBinding();
         }
       }
     } catch (err: any) {
@@ -257,33 +300,24 @@ export class FeishuAdapter implements IMBotAdapter {
   // ── 卡片 ──
 
   private buildCardBody(request: DecisionRequest): string {
+    const optionsText = request.options?.length
+      ? `\n\n**选项**: ${request.options.join(" / ")}`
+      : "";
+
     const elements: any[] = [
       {
         tag: "div",
         text: {
           tag: "lark_md" as const,
-          content: `🤖 **Agent 需要你的决策**\n\n${request.question}\n\n⏰ ${Math.round(request.timeoutMs / 1000)}秒内回复`,
+          content: `🤖 **Agent 需要你的决策**\n\n${request.question}${optionsText}\n\n⏰ ${Math.round(request.timeoutMs / 1000)}秒内回复\n\n请直接回复文字（如"是"或"否"）`,
         },
       },
     ];
 
-    if (request.options?.length) {
-      elements.push({ tag: "hr" });
-      elements.push({
-        tag: "action",
-        actions: request.options.map((opt, i) => ({
-          tag: "button",
-          text: { tag: "lark_md" as const, content: opt },
-          value: JSON.stringify({ id: request.id, option: opt }),
-          type: (i === 0 ? "primary" : "default") as "primary" | "default",
-        })),
-      });
-    }
-
     elements.push({ tag: "hr" });
     elements.push({
       tag: "note",
-      elements: [{ tag: "plain_text", content: `ID:${request.id.slice(0, 8)} — 也可直接回复文本` }],
+      elements: [{ tag: "plain_text", content: `ID:${request.id.slice(0, 8)} — 回复文本即可，无需点按钮` }],
     });
 
     return JSON.stringify({
