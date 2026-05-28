@@ -74,8 +74,7 @@ notify-bridge init
 {
   "mcpServers": {
     "notify-bridge": {
-      "command": "npx",
-      "args": ["notify-bridge"]
+      "command": "notify-bridge"
     }
   }
 }
