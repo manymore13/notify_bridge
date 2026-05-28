@@ -82,16 +82,44 @@ export async function runInit() {
         console.log("\n📡 检查事件订阅...");
         const eventsOk = await checkEvents(token, appId);
         if (!eventsOk) {
-          console.log("\n⚠️  事件订阅未配置! 请先完成以下步骤再继续:");
-          console.log(`  🔗 一键打开: https://open.feishu.cn/app/${appId}/events`);
+          console.log("\n⚠️  事件订阅未配置!");
+          console.log(`  🔗 一键配置: https://open.feishu.cn/app/${appId}/events`);
           console.log("  1. 订阅方式选「长连接」");
           console.log("  2. 添加事件: im.message.receive_v1");
           console.log("  3. 发布管理 → 创建版本并发布");
-          console.log("\n  完成后重新运行 `notify-bridge init`\n");
-          rl.close();
-          return;
+          console.log("\n  配置完成后，这里启动长连接帮你验证...");
         }
-        console.log("  ✅ 事件订阅已配置!");
+
+        // Start WS client for verification
+        console.log("\n🔗 启动长连接 (30秒)...");
+        console.log("  请在飞书后台点击「验证连接状态」按钮");
+        const { createLarkChannel } = await import("@larksuiteoapi/node-sdk");
+        const channel = createLarkChannel({ appId, appSecret });
+        let verified = false;
+        channel.on({
+          message: () => { verified = true; },
+        });
+        await channel.connect();
+        console.log("  ✅ 长连接已建立!");
+
+        if (!eventsOk) {
+          console.log("\n  配置好事件订阅后点击验证...");
+        }
+
+        // Wait 30s for verification
+        await new Promise<void>((resolve) => {
+          let remaining = 30;
+          const timer = setInterval(() => {
+            remaining--;
+            process.stdout.write(`\r  等待验证... ${remaining}s `);
+            if (remaining <= 0 || verified) {
+              clearInterval(timer);
+              console.log(verified ? "\n  ✅ 验证通过!" : "\n  ⏰ 超时, 请检查配置");
+              resolve();
+            }
+          }, 1000);
+        });
+        await channel.disconnect();
       }
     } catch (e: any) {
       console.log(`  ❌ 连接失败: ${e.message}`);
