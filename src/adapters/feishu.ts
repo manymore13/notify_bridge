@@ -225,10 +225,12 @@ export class FeishuAdapter implements IMBotAdapter {
       // 1. 创建 CardKit 2.0 卡片模板
       const cardJson = this.buildCardJson(request);
       const cardData = JSON.stringify(cardJson);
-      console.error(`[feishu] CardKit cardData length: ${cardData.length}, preview: ${cardData.slice(0, 200)}`);
-      const created: any = await this.channel.rawClient.cardkit.v1.card.create({
-        data: { type: "card_json", data: cardData },
-      });
+      console.error(`[feishu] CardKit cardData length: ${cardData.length}`);
+
+      // Try without `data` wrapper (like raw im message API)
+      const created: any = await (this.channel.rawClient as any).cardkit.v1.card.create(
+        { type: "card_json", data: cardData },
+      );
       console.error(`[feishu] CardKit 响应: ${JSON.stringify(created).slice(0, 400)}`);
       const cardId = created?.data?.card_id || created?.card_id;
       if (!cardId) throw new Error(`cardkit.card.create 返回空 card_id: ${JSON.stringify(created).slice(0, 200)}`);
