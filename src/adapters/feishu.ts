@@ -59,7 +59,6 @@ export class FeishuAdapter implements IMBotAdapter {
 
     this.channel.on({
       message: (msg) => { this.handleMessage(msg); },
-      cardAction: (evt) => { this.handleCardAction(evt); },
     });
 
     await this.channel.connect();
@@ -73,7 +72,7 @@ export class FeishuAdapter implements IMBotAdapter {
 
   async sendDecision(request: DecisionRequest, _opts?: SendOptions): Promise<void> {
     this.ensureReady();
-    await this.sendCardkitCard(request);
+    await this.sendImMessage("interactive", JSON.stringify(this.buildCardBody(request)));
   }
 
   async sendNotification(message: string, opts?: SendOptions): Promise<void> {
@@ -215,39 +214,7 @@ export class FeishuAdapter implements IMBotAdapter {
     }
   }
 
-  /** 通过 CardKit 2.0 发送交互卡片 (支持长连接按钮回调) */
-  private async sendCardkitCard(request: DecisionRequest): Promise<void> {
-    if (!this.channel) throw new Error("Channel 未初始化");
-    const receiveId = this.capturedChatId || this.lockedOpenId || "";
-    const receiveIdType = this.capturedChatId ? "chat_id" : "open_id";
-
-    try {
-      // 1. 创建 CardKit 2.0 卡片模板
-      const cardJson = this.buildCardJson(request);
-      const cardData = JSON.stringify(cardJson);
-      console.error(`[feishu] CardKit cardData length: ${cardData.length}`);
-
-      // Try without `data` wrapper (like raw im message API)
-      const created: any = await (this.channel.rawClient as any).cardkit.v1.card.create(
-        { type: "card_json", data: cardData },
-      );
-      console.error(`[feishu] CardKit 响应: ${JSON.stringify(created).slice(0, 400)}`);
-      const cardId = created?.data?.card_id || created?.card_id;
-      if (!cardId) throw new Error(`cardkit.card.create 返回空 card_id: ${JSON.stringify(created).slice(0, 200)}`);
-
-      // 2. 发送引用卡片的消息
-      const content = JSON.stringify({ type: "card", data: { card_id: cardId } });
-      await this.channel.rawClient.im.v1.message.create({
-        params: { receive_id_type: receiveIdType as any },
-        data: { receive_id: receiveId, msg_type: "interactive" as any, content },
-      });
-    } catch (err: any) {
-      console.error(`[feishu] CardKit 发送错误: ${err.message}`);
-      throw err;
-    }
-  }
-
-  private async sendImMessage(msgType: string, content: string, opts?: SendOptions): Promise<void> {
+  private async sendImMessage(msgType: string, content: string, _opts?: SendOptions): Promise<void> {
     if (!this.channel) throw new Error("Channel 未初始化");
     const receiveId = this.capturedChatId || this.lockedOpenId || "";
     const receiveIdType = this.capturedChatId ? "chat_id" : "open_id";
@@ -296,7 +263,7 @@ export class FeishuAdapter implements IMBotAdapter {
 
   // ── 卡片 (带回传按钮, createLarkChannel 长连接支持 cardAction) ──
 
-  private buildCardJson(request: DecisionRequest): object {
+  private buildCardBody(request: DecisionRequest): object {
     const optionsText = request.options?.length
       ? `\n\n**选项**: ${request.options.join(" / ")}`
       : "";
