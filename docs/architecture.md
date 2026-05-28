@@ -10,7 +10,7 @@
 
 **核心场景**: Agent 在编码过程中需要人类确认（删除文件、架构选型、危险操作等），但人不在电脑旁——Agent 通过 IM 发消息到人类手机，人类回复后 Agent 自动继续执行。
 
-**版本**: 0.9.0 | **最后更新**: 2026-05-28 | **状态**: 正式封版 (Approved for Production)
+**版本**: 0.10.0 | **最后更新**: 2026-05-28 | **状态**: 七轮评审修复 (Approved for Production)
 
 **通信模型**:
 
@@ -197,9 +197,14 @@ async loadFromDisk(): Promise<void> {
 async start() {
   this.store.on("recovered", (entry) => {
     const remaining = entry.request.timeoutMs - (Date.now() - entry.request.createdAt);
-    if (remaining <= 0) { await this.store.delete(entry.request.id); return; }
+    if (remaining <= 0) {
+      // early-return 路径也使用 .catch(), 不可裸 await (回调非 async)
+      this.store.delete(entry.request.id).catch(err =>
+        console.error(`[bridge] 过期决策清理失败: ${err.message}`)
+      );
+      return;
+    }
     entry.timer = setTimeout(() => {
-      // ⚠️ setTimeout 不会 await 回调, 必须 try/catch 防 UnhandledRejection
       this.store.delete(entry.request.id).catch(err =>
         console.error(`[bridge] 恢复决策清理失败: ${err.message}`)
       );
@@ -210,9 +215,16 @@ async start() {
     this.store.delete(entry.request.id);
   });
 
+  // 2. 显式触发持久化恢复 (必须在注册事件之后、init 之前)
+  if (this.store instanceof FileDecisionStore) {
+    await this.store.loadFromDisk();
+  }
+
+  // 3. 建立 IM 连接 & 鉴权
   await this.adapter.init();
+
+  // 4. 一切就绪，使能流量
   await this.adapter.start((response) => this.handleReply(response));
-  // loadFromDisk 在 init 内部或之后由 store 自身触发
 }
 ```
 
@@ -228,9 +240,9 @@ async start() {
 3. 创建 DecisionRequest 对象
 4. 创建 Promise (用 deferred 模式获取 resolve/reject)
 5. 注册 setTimeout 超时回调
-6. 将 PendingDecision 写入 this.pending Map ⚠️ (在发IM之前)
-7. await adapter.sendDecision(request) — 发送IM消息
-8. 若发送失败 → 清除 pending 条目 + reject
+6. await store.set(id, entry) — 写入存储 (在发IM之前)
+7. await adapter.sendDecision(request, { signal }) — 发送IM消息
+8. 若发送失败 → await store.delete(id) + reject
 9. 返回 Promise (外部 await 阻塞)
 ```
 
@@ -265,8 +277,11 @@ async requestDecision(question, options, timeoutMs) {
     ]);
 
     // 发送成功 → 注册业务超时 timer
-    const timer = setTimeout(async () => {
-      await this.store.delete(id);
+    // setTimeout 回调不可 async (与 §12.1 规则一致)
+    const timer = setTimeout(() => {
+      this.store.delete(id).catch(err =>
+        console.error(`[bridge] 超时决策清理失败: ${err.message}`)
+      );
       rejectFn(new Error(`决策超时 (${timeoutMs}ms)`));
     }, timeoutMs);
     entry.timer = timer;
@@ -313,8 +328,55 @@ async requestDecision(question, options, timeoutMs) {
 │    仅当 decisionId 为空 且 选项匹配无结果时           │
 │    按 createdAt 排序，取最旧的 pending               │
 │                                                      │
-│ 5. 清除定时器 + 从 Map 删除 + resolve(answer)         │
+│ 5. 清除定时器 + await store.delete() + resolve(answer)  │
 └──────────────────────────────────────────────────────┘
+```
+
+**handleReply 异步化实现 (v0.10.0)**:
+
+```typescript
+// ⚠️ store 全面异步化后, handleReply 必须是 async
+private async handleReply(response: DecisionResponse): Promise<void> {
+  if (await this.store.getSize() === 0) return;
+
+  let matched: PendingDecision | undefined;
+
+  // 1. decisionId 精确匹配
+  if (response.decisionId) {
+    matched = await this.store.get(response.decisionId);
+  }
+
+  // 2. 选项匹配 (降级)
+  if (!matched) {
+    const entries = await this.store.getAll();
+    for (const [, pending] of entries) {
+      if (pending.request.options?.includes(response.answer)) {
+        matched = pending; break;
+      }
+    }
+  }
+
+  // 3. FIFO (最后手段)
+  if (!matched) {
+    const entries = await this.store.getAll();
+    entries.sort((a, b) => a[1].request.createdAt - b[1].request.createdAt);
+    if (entries.length > 0) matched = entries[0][1];
+  }
+
+  if (matched) {
+    clearTimeout(matched.timer);
+    await this.store.delete(matched.request.id);
+    matched.resolve(response.answer);
+  }
+}
+```
+
+**调用侧兜底 (适配器内)**:
+
+```typescript
+// 适配器事件回调中: onReply 是 async, 不 await, 但必须 .catch()
+this.onReply?.({ decisionId, answer, respondedAt: Date.now() })
+  ?.catch(err => console.error(`[adapter] handleReply 异常: ${err.message}`));
 ```
 
 **decisionId 来源**:
@@ -461,14 +523,14 @@ async getPendingDecisions(): Promise<{ id: string; question: string; elapsedMs: 
   }));
 }
 
-getStatus(): { imType: string; ready: boolean; pendingCount: number; detail: any } {
-  // getStatus 保持同步 — ready/pendingCount 基于内存计数器
-  const adapterStatus = (this.adapter as any).getStatus?.() || {};
+// v0.10.0: 统一走 store.getSize(), 不维护额外计数器
+async getStatus(): Promise<{ imType: string; ready: boolean; pendingCount: number; detail: any }> {
+  const status = this.adapter.getStatus();
   return {
     imType: config.im.type,
-    ready: (this.adapter as any).isReady?.() ?? true,
-    pendingCount: this.pendingCount,    // 同步计数器
-    detail: adapterStatus,
+    ready: this.adapter.isReady(),
+    pendingCount: await this.store.getSize(),
+    detail: status,
   };
 }
 ```
@@ -1328,6 +1390,7 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | 0.7.0 | 2026-05-28 | 封版: stop()适配IDecisionStore异步API、Telegram轮询AbortController优雅退出 |
 | 0.8.0 | 2026-05-28 | 六轮评审: handleCardAction锁定、bridge_status await、清除回调冗余、IDecisionStore解耦EventEmitter、BaseBotAdapter基类 |
 | 0.9.0 | 2026-05-28 | 正式封版: setTimeout防UnhandledRejection、EventEmitter组合替代继承、代码落地注意事项 |
+| 0.10.0 | 2026-05-28 | 七轮评审: recovered裸await修复、requestDecision回调去async、handleReply异步化、loadFromDisk调用时机明确、去掉pendingCount统一store.getSize |
 
 ## 11. 评审记录
 
@@ -1340,7 +1403,8 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | 2026-05-28 | 五轮 | Pass with Revision → 趋于完美 | 4项: Telegram死循环、UnhandledRejection、Store同步I/O、解锁劫持 |
 | 2026-05-28 | 终审 | Approved for Production ✅ | 2项微瑕: stop()旧API残留、Telegram轮询非优雅退出 |
 | 2026-05-28 | 六轮 | Conditional Disapproval → 修复后通过 | 3Bug + 3架构 |
-| 2026-05-28 | 终审 | Approved for Production ✅ | 2微瑕: setTimeout回调异常、EventEmitter类型冲突 (代码级备忘) |
+| 2026-05-28 | 终审 | Approved for Production ✅ | 2微瑕: setTimeout回调异常、EventEmitter类型冲突 |
+| 2026-05-28 | 七轮 | Conditional Disapproval → 修复 | 3Bug: recovered裸await、setTimeout async矛盾、handleReply异步化缺失; 2架构: loadFromDisk时机、pendingCount无规范 |
 
 ## 12. 代码落地注意事项 (v0.9.0)
 
