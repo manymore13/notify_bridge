@@ -216,23 +216,19 @@ export class FeishuAdapter implements IMBotAdapter {
   }
 
   private async sendImMessage(msgType: string, content: string, opts?: SendOptions): Promise<void> {
+    if (!this.channel) throw new Error("Channel 未初始化");
     const receiveId = this.capturedChatId || this.lockedOpenId || "";
     const receiveIdType = this.capturedChatId ? "chat_id" : "open_id";
 
     try {
-      const res = await axios.post(
-        "https://open.feishu.cn/open-apis/im/v1/messages",
-        { receive_id: receiveId, msg_type: msgType, content },
-        {
-          headers: { Authorization: `Bearer ${await this.getAccessToken()}` },
-          params: { receive_id_type: receiveIdType },
-          signal: opts?.signal,
-        }
-      );
-      const code = res.data?.code;
+      const res: any = await this.channel.rawClient.im.v1.message.create({
+        params: { receive_id_type: receiveIdType as any },
+        data: { receive_id: receiveId, msg_type: msgType as any, content },
+      });
+      const code = res?.code;
       if (code === 0) { this.identityFailures = 0; return; }
 
-      const errorType = res.data?.msg || "";
+      const errorType = res?.msg || "";
       if (IDENTITY_INVALID_CODES.has(errorType)) {
         this.identityFailures++;
         if (this.identityFailures >= 3) {
@@ -245,7 +241,7 @@ export class FeishuAdapter implements IMBotAdapter {
         }
       }
     } catch (err: any) {
-      if (err.name === "AbortError") return;
+      if (err.name === "AbortError" || err.code === "ERR_CANCELED") return;
       console.error(`[feishu] 发送错误: ${err.message}`);
     }
   }
