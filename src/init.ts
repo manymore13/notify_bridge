@@ -153,14 +153,18 @@ export async function runInit() {
   const mdPath = isGlobal
     ? join(homedir(), ".claude", "CLAUDE.md")
     : join(process.cwd(), "CLAUDE.md");
-  const rule = `# notify-bridge 决策规则
+  const rule = `# Human-in-the-Loop 决策规则
 
-## 必须通过飞书通知的场景
-- 删除文件、git push/force push、git reset --hard 等不可逆操作
-- 架构选型、库替换等需要我决策的事项
-- 长时间任务（>30秒）完成后发送通知
+你有 notify-bridge MCP 工具可以向我飞书发消息。**所有 agent（包括子 agent）都必须遵守**。
 
-调用方式: request_decision("问题", ["选项1","选项2"]) 或 send_notification("通知内容")
+## 必须发飞书确认的场景
+1. 删除文件/目录 → request_decision("确认删除 xxx?", ["确认","取消"])
+2. git push/force push/reset --hard → request_decision("确认执行?", ["确认","取消"])
+3. 安装/卸载依赖 → request_decision("确认安装 xxx?", ["确认","取消"])
+4. 数据库修改、文件覆盖等不可逆操作
+5. 长任务（>30秒）完成 → send_notification("完成: xxx")
+
+调用方式: request_decision("问题", ["选项1","选项2"]) 发飞书卡片阻塞等回复
 `;
   const existingMd = existsSync(mdPath) ? readFileSync(mdPath, "utf-8") : "";
   if (!existingMd.includes("notify-bridge")) {
