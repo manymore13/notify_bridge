@@ -51,7 +51,7 @@ export class FeishuAdapter implements IMBotAdapter {
     });
     this.channel.on({
       message: (msg) => this.handleMessage(msg),
-      cardAction: (evt) => { this.handleCardAction(evt); },
+      cardAction: async (evt) => { this.handleCardAction(evt); },
     });
     await this.channel.connect();
     console.error(`[feishu] 长连接已建立 (Channel API + CardKit 2.0)`);
