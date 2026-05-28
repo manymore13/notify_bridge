@@ -1,5 +1,5 @@
 import axios from "axios";
-import * as Lark from "@larksuiteoapi/node-sdk";
+import { createLarkChannel, type LarkChannel } from "@larksuiteoapi/node-sdk";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -16,26 +16,20 @@ enum AuthState {
 }
 
 const IDENTITY_INVALID_CODES = new Set([
-  "user_not_found",
-  "chat_not_found",
-  "no_permission",
-  "receive_id_not_authorized",
+  "user_not_found", "chat_not_found", "no_permission", "receive_id_not_authorized",
 ]);
 
 export class FeishuAdapter implements IMBotAdapter {
   private cfg: FeishuConfig;
-  private wsClient: Lark.WSClient | null = null;
-  private stopped = false;
+  private channel: LarkChannel | null = null;
   private onReply: ((r: DecisionResponse) => Promise<void>) | null = null;
 
-  // 身份管理
   private authState = AuthState.UNBOUND;
   private lockedOpenId: string | null = null;
   private capturedChatId: string | null = null;
   private allowedUsers: Set<string>;
   private identityFailures = 0;
 
-  // Token
   private tenantAccessToken = "";
   private tokenExpireAt = 0;
 
@@ -48,55 +42,43 @@ export class FeishuAdapter implements IMBotAdapter {
     }
   }
 
-  // ── IMBotAdapter 接口 ──
+  // ── IMBotAdapter ──
 
   async init(): Promise<void> {
-    this.stopped = false;
     this.loadBinding();
     await this.getAccessToken();
   }
 
-  async start(callback: (response: DecisionResponse) => Promise<void>): Promise<void> {
+  async start(callback: (r: DecisionResponse) => Promise<void>): Promise<void> {
     this.onReply = callback;
 
-    this.wsClient = new Lark.WSClient({
+    this.channel = createLarkChannel({
       appId: this.cfg.appId,
       appSecret: this.cfg.appSecret,
-      loggerLevel: Lark.LoggerLevel.info,
     });
 
-    const dispatcher = new Lark.EventDispatcher({}).register({
-      "im.message.receive_v1": (data: any) => {
-        this.handleMessageEvent(data);
-        return Promise.resolve();
-      },
-      "card.action.trigger": (data: any) => {
-        this.handleCardAction(data);
-        return Promise.resolve();
-      },
+    this.channel.on({
+      message: (msg) => { this.handleMessage(msg); },
+      cardAction: (evt) => { this.handleCardAction(evt); },
     });
 
-    await this.wsClient.start({ eventDispatcher: dispatcher });
-    console.error(`[feishu] 长连接已建立`);
+    await this.channel.connect();
+    console.error(`[feishu] 长连接已建立 (Channel API)`);
   }
 
   async stop(): Promise<void> {
-    this.stopped = true;
-    try { (this.wsClient as any)?.stop?.(); } catch {}
-    try { (this.wsClient as any)?.close?.(); } catch {}
-    this.wsClient = null;
+    try { await this.channel?.disconnect(); } catch {}
+    this.channel = null;
   }
 
   async sendDecision(request: DecisionRequest, opts?: SendOptions): Promise<void> {
     this.ensureReady();
-    const token = await this.getAccessToken();
-    await this.sendImMessage(token, "interactive", this.buildCardBody(request), opts);
+    await this.sendImMessage("interactive", this.buildCard(request), opts);
   }
 
   async sendNotification(message: string, opts?: SendOptions): Promise<void> {
     this.ensureReady();
-    const token = await this.getAccessToken();
-    await this.sendImMessage(token, "text", JSON.stringify({ text: `📢 ${message}` }), opts);
+    await this.sendImMessage("text", JSON.stringify({ text: `📢 ${message}` }), opts);
   }
 
   async checkHealth(): Promise<HealthStatus> {
@@ -124,7 +106,7 @@ export class FeishuAdapter implements IMBotAdapter {
     };
   }
 
-  // ── 持久化绑定 ──
+  // ── 持久化 ──
 
   private loadBinding(): void {
     try {
@@ -137,7 +119,7 @@ export class FeishuAdapter implements IMBotAdapter {
           console.error(`[feishu] 📂 加载持久化绑定: ${data.openId}`);
         }
       }
-    } catch { /* ignore */ }
+    } catch {}
   }
 
   private saveBinding(): void {
@@ -148,7 +130,7 @@ export class FeishuAdapter implements IMBotAdapter {
         chatId: this.capturedChatId,
         updatedAt: new Date().toISOString(),
       }, null, 2));
-    } catch { /* ignore */ }
+    } catch {}
   }
 
   private clearBinding(): void {
@@ -157,55 +139,47 @@ export class FeishuAdapter implements IMBotAdapter {
 
   // ── 安全门禁 ──
 
-  private gateIncoming(operatorOpenId: string | undefined): boolean {
-    // PENDING_REBIND: 拒绝所有人
+  private gateIncoming(senderOpenId: string | undefined): boolean {
     if (this.authState === AuthState.PENDING_REBIND) {
-      console.warn(`[feishu] PENDING_REBIND: 拒绝事件, 需管理员重置`);
+      console.warn(`[feishu] PENDING_REBIND: 拒绝事件`);
       return false;
     }
-    if (!operatorOpenId) return true;
-
-    // 白名单检查
-    if (this.allowedUsers.size > 0 && !this.allowedUsers.has(operatorOpenId)) {
-      console.warn(`[feishu] 非白名单用户 ${operatorOpenId} 已丢弃`);
+    if (!senderOpenId) return true;
+    if (this.allowedUsers.size > 0 && !this.allowedUsers.has(senderOpenId)) {
+      console.warn(`[feishu] 非白名单用户 ${senderOpenId} 已丢弃`);
       return false;
     }
-    // 锁定检查
-    if (this.lockedOpenId && operatorOpenId !== this.lockedOpenId) {
-      console.warn(`[feishu] 非锁定用户 ${operatorOpenId} 已丢弃`);
+    if (this.lockedOpenId && senderOpenId !== this.lockedOpenId) {
+      console.warn(`[feishu] 非锁定用户 ${senderOpenId} 已丢弃`);
       return false;
     }
-    // 首次捕获 → 持久化
     if (!this.lockedOpenId) {
-      this.lockedOpenId = operatorOpenId;
+      this.lockedOpenId = senderOpenId;
       this.authState = AuthState.BOUND_LOCKED;
       this.saveBinding();
-      console.error(`[feishu] 🔒 锁定用户: ${operatorOpenId}`);
+      console.error(`[feishu] 🔒 锁定用户: ${senderOpenId}`);
     }
     return true;
   }
 
-  // ── 事件处理 ──
+  // ── 事件处理 (createLarkChannel normalized events) ──
 
-  private handleMessageEvent(data: any): void {
+  private handleMessage(msg: any): void {
     try {
-      const event = data.event || data;
-      const operatorOpenId = event.sender?.sender_id?.open_id;
-      if (!this.gateIncoming(operatorOpenId)) return;
+      const senderOpenId = msg.senderId;
+      if (!this.gateIncoming(senderOpenId)) return;
 
-      if (event.message?.chat_id && event.message.chat_id !== this.capturedChatId) {
-        this.capturedChatId = event.message.chat_id;
+      if (msg.chatId && msg.chatId !== this.capturedChatId) {
+        this.capturedChatId = msg.chatId;
         this.saveBinding();
       }
 
-      if (!event.message?.content) return;
-      const msgContent = JSON.parse(event.message.content);
-      const text = (msgContent.text || "").trim();
+      const text = (msg.content || "").trim();
       if (!text) return;
 
       console.error(`[feishu] 📩 收到: "${text.slice(0, 50)}"`);
       this.onReply?.({
-        decisionId: `fe-${event.message.message_id || Date.now()}`,
+        decisionId: `fe-${msg.messageId || Date.now()}`,
         answer: text,
         respondedAt: Date.now(),
       })?.catch((err) => console.error(`[feishu] onReply 异常: ${err.message}`));
@@ -214,19 +188,19 @@ export class FeishuAdapter implements IMBotAdapter {
     }
   }
 
-  private handleCardAction(data: any): void {
+  private handleCardAction(evt: any): void {
     try {
-      const operatorOpenId = data.event?.operator?.open_id || data.event?.operator?.user_id;
+      const operatorOpenId = evt.operatorId || evt.operator?.open_id;
       if (!this.gateIncoming(operatorOpenId)) return;
 
-      const raw = data.event?.action?.value || data.action?.value || "";
+      const raw = evt.action?.value ?? "";
       let decisionId = "";
       let answer = raw;
       try {
         const parsed = JSON.parse(raw);
         decisionId = parsed.id || "";
         answer = parsed.option || raw;
-      } catch { /* 兼容旧格式 */ }
+      } catch {}
 
       console.error(`[feishu] 🃏 卡片: "${answer}"`);
       this.onReply?.({ decisionId, answer, respondedAt: Date.now() })
@@ -244,9 +218,7 @@ export class FeishuAdapter implements IMBotAdapter {
     }
   }
 
-  private async sendImMessage(
-    token: string, msgType: string, content: string, opts?: SendOptions
-  ): Promise<void> {
+  private async sendImMessage(msgType: string, content: string, opts?: SendOptions): Promise<void> {
     const receiveId = this.capturedChatId || this.lockedOpenId || "";
     const receiveIdType = this.capturedChatId ? "chat_id" : "open_id";
 
@@ -255,7 +227,7 @@ export class FeishuAdapter implements IMBotAdapter {
         "https://open.feishu.cn/open-apis/im/v1/messages",
         { receive_id: receiveId, msg_type: msgType, content },
         {
-          headers: { Authorization: `Bearer ${token}` },
+          headers: { Authorization: `Bearer ${await this.getAccessToken()}` },
           params: { receive_id_type: receiveIdType },
           signal: opts?.signal,
         }
@@ -297,9 +269,9 @@ export class FeishuAdapter implements IMBotAdapter {
     return this.tenantAccessToken;
   }
 
-  // ── 卡片 ──
+  // ── 卡片 (带回传按钮, createLarkChannel 长连接支持 cardAction) ──
 
-  private buildCardBody(request: DecisionRequest): string {
+  private buildCard(request: DecisionRequest): string {
     const optionsText = request.options?.length
       ? `\n\n**选项**: ${request.options.join(" / ")}`
       : "";
@@ -309,15 +281,29 @@ export class FeishuAdapter implements IMBotAdapter {
         tag: "div",
         text: {
           tag: "lark_md" as const,
-          content: `🤖 **Agent 需要你的决策**\n\n${request.question}${optionsText}\n\n⏰ ${Math.round(request.timeoutMs / 1000)}秒内回复\n\n请直接回复文字（如"是"或"否"）`,
+          content: `🤖 **Agent 需要你的决策**\n\n${request.question}${optionsText}\n\n⏰ ${Math.round(request.timeoutMs / 1000)}秒内回复`,
         },
       },
     ];
 
+    // 交互按钮 — createLarkChannel 的 cardAction 事件通过长连接接收
+    if (request.options?.length) {
+      elements.push({ tag: "hr" });
+      elements.push({
+        tag: "action",
+        actions: request.options.map((opt, i) => ({
+          tag: "button",
+          text: { tag: "lark_md" as const, content: opt },
+          value: JSON.stringify({ id: request.id, option: opt }),
+          type: (i === 0 ? "primary" : "default") as "primary" | "default",
+        })),
+      });
+    }
+
     elements.push({ tag: "hr" });
     elements.push({
       tag: "note",
-      elements: [{ tag: "plain_text", content: `ID:${request.id.slice(0, 8)} — 回复文本即可，无需点按钮` }],
+      elements: [{ tag: "plain_text", content: `ID:${request.id.slice(0, 8)} — 可点按钮或直接回文字` }],
     });
 
     return JSON.stringify({
