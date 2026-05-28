@@ -129,15 +129,15 @@ export class FeishuAdapter implements IMBotAdapter {
 
     if (request.options?.length) {
       elements.push({ tag: "hr" });
-      elements.push({
-        tag: "action",
-        actions: request.options.map((opt, i) => ({
+      // CardKit 2.0: 按钮直接放 elements, 不用 action 包裹
+      for (let i = 0; i < request.options.length; i++) {
+        elements.push({
           tag: "button",
-          text: { tag: "plain_text" as const, content: opt },
-          value: { id: request.id, option: opt },
+          text: { tag: "plain_text" as const, content: request.options[i] },
+          value: { id: request.id, option: request.options[i] },
           type: i === 0 ? "primary" : "default",
-        })),
-      });
+        });
+      }
     }
 
     elements.push({ tag: "hr" });
