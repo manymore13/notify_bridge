@@ -61,10 +61,10 @@ function addEntry(configPath: string, entry: any) {
 
 function setupProject() {
   const projectRoot = process.cwd();
-  const configPath = join(projectRoot, ".claude", "mcp.json");
+  const configPath = join(projectRoot, ".mcp.json");
 
   console.log(`项目级配置: ${projectRoot}`);
-  console.log(`文件: .claude/mcp.json`);
+  console.log(`文件: .mcp.json`);
 
   addEntry(configPath, {
     command: "notify-bridge",
