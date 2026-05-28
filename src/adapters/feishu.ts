@@ -227,8 +227,9 @@ export class FeishuAdapter implements IMBotAdapter {
       const created: any = await this.channel.rawClient.cardkit.v1.card.create({
         data: { type: "card_json", data: JSON.stringify(cardJson) },
       });
-      const cardId = created?.data?.card_id;
-      if (!cardId) throw new Error("cardkit.card.create 返回空 card_id");
+      console.error(`[feishu] CardKit 响应: ${JSON.stringify(created).slice(0, 400)}`);
+      const cardId = created?.data?.card_id || created?.card_id;
+      if (!cardId) throw new Error(`cardkit.card.create 返回空 card_id: ${JSON.stringify(created).slice(0, 200)}`);
 
       // 2. 发送引用卡片的消息
       const content = JSON.stringify({ type: "card", data: { card_id: cardId } });
