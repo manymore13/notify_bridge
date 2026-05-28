@@ -155,16 +155,22 @@ export async function runInit() {
     : join(process.cwd(), "CLAUDE.md");
   const rule = `# Human-in-the-Loop 决策规则
 
-你有 notify-bridge MCP 工具可以向我飞书发消息。**所有 agent（包括子 agent）都必须遵守**。
+你有 notify-bridge MCP 工具向飞书发消息。**所有 agent（包括子 agent）都必须遵守**。
 
-## 必须发飞书确认的场景
-1. 删除文件/目录 → request_decision("确认删除 xxx?", ["确认","取消"])
-2. git push/force push/reset --hard → request_decision("确认执行?", ["确认","取消"])
-3. 安装/卸载依赖 → request_decision("确认安装 xxx?", ["确认","取消"])
-4. 数据库修改、文件覆盖等不可逆操作
-5. 长任务（>30秒）完成 → send_notification("完成: xxx")
+## 核心原则
+任何需要人类介入的场景，都必须发飞书，禁止使用 AskUserQuestion 弹窗。
 
-调用方式: request_decision("问题", ["选项1","选项2"]) 发飞书卡片阻塞等回复
+## 必须发飞书的场景
+### 需要决策/选择 → request_decision
+- 删除文件、git push/force push、安装依赖等不可逆操作
+- 架构选型、方案选择 → 列出选项
+- 头脑风暴有多个方案 → 发飞书选
+- 需要澄清/补充需求 → 发飞书问
+
+### 只需通知 → send_notification
+- 长任务（>30秒）完成 → "完成: xxx"
+
+调用: request_decision("问题", ["选项1","选项2"]) 发飞书卡片阻塞等回复
 `;
   const existingMd = existsSync(mdPath) ? readFileSync(mdPath, "utf-8") : "";
   if (!existingMd.includes("notify-bridge")) {
