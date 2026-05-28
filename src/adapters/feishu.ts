@@ -46,7 +46,8 @@ export class FeishuAdapter implements IMBotAdapter {
       appId: this.cfg.appId,
       appSecret: this.cfg.appSecret,
       includeRawEvent: true,
-      loggerLevel: 1, // info
+      loggerLevel: 1,
+      outbound: { streamThrottleMs: 400 },
     });
     this.channel.on({
       message: (msg) => this.handleMessage(msg),
