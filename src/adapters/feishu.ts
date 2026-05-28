@@ -140,12 +140,6 @@ export class FeishuAdapter implements IMBotAdapter {
       }
     }
 
-    elements.push({ tag: "hr" });
-    elements.push({
-      tag: "note",
-      elements: [{ tag: "plain_text" as const, content: `ID:${request.id.slice(0, 8)}` }],
-    });
-
     return {
       schema: "2.0",
       config: { wide_screen_mode: true },
