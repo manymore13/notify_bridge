@@ -13,7 +13,6 @@ if (cmd === "setup") {
     process.exit(1);
   });
 } else {
-  // Default: run as MCP server
   process.on("SIGINT", () => process.exit(0));
   process.on("SIGTERM", () => process.exit(0));
 

@@ -12,16 +12,23 @@ export interface DecisionResponse {
   respondedAt: number;
 }
 
+export interface HealthStatus {
+  status: "healthy" | "unhealthy" | "connecting";
+  reason?: string;
+  details?: Record<string, any>;
+}
+
+export interface SendOptions {
+  signal?: AbortSignal;
+}
+
 export interface IMBotAdapter {
-  /** Send a decision request message to the human */
-  sendDecision(request: DecisionRequest): Promise<void>;
-
-  /** Send a one-way notification */
-  sendNotification(message: string): Promise<void>;
-
-  /** Start listening for incoming replies (webhook or polling) */
-  start(callback: (response: DecisionResponse) => void): Promise<void>;
-
-  /** Stop the adapter */
+  init(): Promise<void>;
+  start(callback: (response: DecisionResponse) => Promise<void>): Promise<void>;
   stop(): Promise<void>;
+  sendDecision(request: DecisionRequest, opts?: SendOptions): Promise<void>;
+  sendNotification(message: string, opts?: SendOptions): Promise<void>;
+  checkHealth(): Promise<HealthStatus>;
+  isReady(): boolean;
+  getStatus(): Record<string, any>;
 }

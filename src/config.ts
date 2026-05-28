@@ -1,17 +1,19 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFileSync, existsSync } from "node:fs";
+import { resolve, join, dirname } from "node:path";
+import { homedir } from "node:os";
 
 export interface FeishuConfig {
   appId: string;
   appSecret: string;
-  /** 可选：如果配置了直接使用，否则从第一条消息中自动捕获 */
   receiveId?: string;
   receiveIdType?: "open_id" | "user_id" | "email";
+  allowedUserIds?: string[];
 }
 
 export interface TelegramConfig {
   botToken: string;
   chatId: string;
+  allowedUserIds?: string[];
 }
 
 export interface IMConfig {
@@ -25,37 +27,65 @@ export interface BridgeConfig {
   defaultTimeoutMs: number;
 }
 
+/** 向上递归查找 config.json, 回退到 ~/.notify-bridge/config.json */
+function findConfigPath(): string | null {
+  let dir = process.cwd();
+  while (true) {
+    const p = join(dir, "config.json");
+    if (existsSync(p)) return p;
+    const parent = resolve(dir, "..");
+    if (parent === dir) break;
+    dir = parent;
+  }
+  const homePath = join(homedir(), ".notify-bridge", "config.json");
+  if (existsSync(homePath)) return homePath;
+  return null;
+}
+
 function loadConfig(): BridgeConfig {
-  const configPath = resolve(process.cwd(), "config.json");
   let fileConfig: any = {};
-  try {
-    fileConfig = JSON.parse(readFileSync(configPath, "utf-8"));
-  } catch {
-    // No config file, use env vars
+  const configPath = findConfigPath();
+  if (configPath) {
+    try {
+      fileConfig = JSON.parse(readFileSync(configPath, "utf-8"));
+    } catch {
+      console.error(`[config] ${configPath} 解析失败，将使用环境变量`);
+    }
   }
 
-  // 环境变量优先于 config.json
-  const imType = process.env.BRIDGE_IM_TYPE || fileConfig.im?.type || "telegram";
+  const imType = (process.env.BRIDGE_IM_TYPE || fileConfig.im?.type || "telegram") as any;
   const fcfg = fileConfig.im?.feishu || {};
+  const tcfg = fileConfig.im?.telegram || {};
+
+  const parseIds = (raw: string | undefined): string[] | undefined => {
+    if (!raw) return undefined;
+    return raw.split(",").map((s) => s.trim()).filter(Boolean);
+  };
 
   const im: IMConfig = {
     type: imType,
     feishu: {
-      // 凭证强制从环境变量读取，不允许在 config.json 中明文存储
       appId: process.env.FEISHU_APP_ID || fcfg.appId || "",
       appSecret: process.env.FEISHU_APP_SECRET || "",
       receiveId: process.env.FEISHU_RECEIVE_ID || fcfg.receiveId || undefined,
       receiveIdType: (process.env.FEISHU_RECEIVE_ID_TYPE || fcfg.receiveIdType || "open_id") as any,
+      allowedUserIds: parseIds(process.env.FEISHU_ALLOWED_USER_IDS)
+        || (fcfg.allowedUserIds?.length ? fcfg.allowedUserIds : undefined),
     },
     telegram: {
       botToken: process.env.TELEGRAM_BOT_TOKEN || "",
-      chatId: process.env.TELEGRAM_CHAT_ID || fileConfig.im?.telegram?.chatId || "",
+      chatId: process.env.TELEGRAM_CHAT_ID || tcfg.chatId || "",
+      allowedUserIds: parseIds(process.env.TELEGRAM_ALLOWED_USER_IDS)
+        || (tcfg.allowedUserIds?.length ? tcfg.allowedUserIds : undefined),
     },
   };
 
   return {
     im,
-    defaultTimeoutMs: fileConfig.defaultTimeoutMs || Number(process.env.BRIDGE_DEFAULT_TIMEOUT_MS) || 300000,
+    defaultTimeoutMs:
+      Number(process.env.BRIDGE_DEFAULT_TIMEOUT_MS) ||
+      fileConfig.defaultTimeoutMs ||
+      300000,
   };
 }
 

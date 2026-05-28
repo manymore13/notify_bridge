@@ -1,156 +1,305 @@
 import crypto from "node:crypto";
+import { EventEmitter } from "node:events";
+import { promises as fs } from "node:fs";
 import type { IMBotAdapter, DecisionRequest, DecisionResponse } from "./adapters/types.js";
 import { config } from "./config.js";
 
-interface PendingDecision {
+// ── IDecisionStore ──
+
+export interface PendingDecision {
   request: DecisionRequest;
   resolve: (answer: string) => void;
   reject: (err: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
+  timer?: ReturnType<typeof setTimeout>;
 }
+
+export interface IDecisionStore {
+  get(id: string): Promise<PendingDecision | undefined>;
+  set(id: string, entry: PendingDecision): Promise<void>;
+  delete(id: string): Promise<boolean>;
+  getAll(): Promise<[string, PendingDecision][]>;
+  getSize(): Promise<number>;
+  clear(): Promise<void>;
+  on(event: "recovered" | "expired", cb: (entry: PendingDecision) => void): this;
+  off(event: "recovered" | "expired", cb: (entry: PendingDecision) => void): this;
+}
+
+// ── MemoryDecisionStore ──
+
+export class MemoryDecisionStore implements IDecisionStore {
+  private map = new Map<string, PendingDecision>();
+  private emitter = new EventEmitter();
+
+  async get(id: string) { return this.map.get(id); }
+  async set(id: string, entry: PendingDecision) { this.map.set(id, entry); }
+  async delete(id: string) { return this.map.delete(id); }
+  async getAll() { return Array.from(this.map.entries()); }
+  async getSize() { return this.map.size; }
+  async clear() { this.map.clear(); }
+
+  on(event: "recovered" | "expired", cb: (entry: PendingDecision) => void): this {
+    this.emitter.on(event, cb); return this;
+  }
+  off(event: "recovered" | "expired", cb: (entry: PendingDecision) => void): this {
+    this.emitter.off(event, cb); return this;
+  }
+}
+
+// ── FileDecisionStore (持久化) ──
+
+export class FileDecisionStore extends EventEmitter implements IDecisionStore {
+  private map = new Map<string, PendingDecision>();
+  private filePath: string;
+  private isFlushing = false;
+  private needsFlush = false;
+
+  constructor(filePath: string) {
+    super();
+    this.filePath = filePath;
+  }
+
+  /** 审计模式: 日志记录 + 清空文件, 不恢复 Promise */
+  async loadFromDisk(): Promise<void> {
+    try {
+      const raw = JSON.parse(await fs.readFile(this.filePath, "utf-8"));
+      const now = Date.now();
+      let abandoned = 0;
+      for (const item of raw) {
+        const remaining = item.timeoutMs - (now - item.createdAt);
+        if (remaining > 0) {
+          abandoned++;
+          console.warn(`[store] 丢弃未完成决策 id=${(item.id || "").slice(0, 8)} (进程重启)`);
+        }
+      }
+      if (abandoned > 0) console.warn(`[store] 已丢弃 ${abandoned} 个旧决策`);
+      await fs.writeFile(this.filePath, "[]", "utf-8");
+    } catch (err: any) {
+      if (err.code !== "ENOENT") console.error(`[store] 加载失败: ${err.message}`);
+    }
+  }
+
+  private async flushToDisk(): Promise<void> {
+    if (this.isFlushing) { this.needsFlush = true; return; }
+    this.isFlushing = true;
+    try {
+      const data = Array.from(this.map.values()).map((e) => ({
+        id: e.request.id,
+        createdAt: e.request.createdAt,
+        timeoutMs: e.request.timeoutMs,
+        question: e.request.question,
+      }));
+      await fs.writeFile(this.filePath, JSON.stringify(data, null, 2), "utf-8");
+    } finally {
+      this.isFlushing = false;
+      if (this.needsFlush) { this.needsFlush = false; await this.flushToDisk(); }
+    }
+  }
+
+  async get(id: string) { return this.map.get(id); }
+  async set(id: string, entry: PendingDecision) { this.map.set(id, entry); await this.flushToDisk(); }
+  async delete(id: string) { const ok = this.map.delete(id); if (ok) await this.flushToDisk(); return ok; }
+  async getAll() { return Array.from(this.map.entries()); }
+  async getSize() { return this.map.size; }
+  async clear() { this.map.clear(); await this.flushToDisk(); }
+
+  on(event: "recovered" | "expired", cb: (entry: PendingDecision) => void): this {
+    super.on(event, cb); return this;
+  }
+  off(event: "recovered" | "expired", cb: (entry: PendingDecision) => void): this {
+    super.off(event, cb); return this;
+  }
+}
+
+// ── RateLimitError ──
+
+export class RateLimitError extends Error {
+  constructor(public retryAfterMs: number) {
+    super(`频控: 请等待 ${Math.round(retryAfterMs / 1000)}s 后重试`);
+  }
+}
+
+// ── NotifyBridge ──
+
+const SEND_TIMEOUT_MS = 5000;
 
 export class NotifyBridge {
   private adapter: IMBotAdapter;
-  private pending = new Map<string, PendingDecision>();
+  private store: IDecisionStore;
 
-  // 频控：最多 5 个决策/分钟，1 个通知/秒
+  // 频控
   private decisionTimestamps: number[] = [];
   private notificationTimestamps: number[] = [];
-  private readonly maxDecisionsPerMinute = 5;
-  private readonly maxNotificationsPerSecond = 3;
 
-  constructor(adapter: IMBotAdapter) {
+  constructor(adapter: IMBotAdapter, store?: IDecisionStore) {
     this.adapter = adapter;
+    this.store = store || new MemoryDecisionStore();
   }
 
   async start(): Promise<void> {
-    await this.adapter.start((response) => this.handleReply(response));
+    // 1. 清理旧进程遗留
+    if (this.store instanceof FileDecisionStore) {
+      await this.store.loadFromDisk();
+    }
+    // 2. 建立连接 & 鉴权
+    await this.adapter.init();
+    const health = await this.adapter.checkHealth();
+    if (health.status === "unhealthy") throw new Error(`Adapter unhealthy: ${health.reason}`);
+    // 3. 使能流量
+    await this.adapter.start((response) => this.handleReply(response));  // handleReply returns Promise<void>
   }
 
   async stop(): Promise<void> {
-    for (const [, pending] of this.pending) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error("Bridge shutting down"));
+    const all = await this.store.getAll();
+    for (const [, entry] of all) {
+      if (entry.timer) clearTimeout(entry.timer);
+      entry.reject(new Error("Bridge shutting down"));
     }
-    this.pending.clear();
+    await this.store.clear();
     await this.adapter.stop();
   }
 
-  private checkDecisionRateLimit(): void {
+  // ── 频控 ──
+
+  private checkDecisionRateLimit(): { allowed: boolean; retryAfterMs?: number } {
     const now = Date.now();
-    this.decisionTimestamps = this.decisionTimestamps.filter(t => now - t < 60000);
-    if (this.decisionTimestamps.length >= this.maxDecisionsPerMinute) {
-      throw new Error(`决策频控: 每分钟最多 ${this.maxDecisionsPerMinute} 次请求，请稍后再试。如果 Agent 陷入循环请手动介入。`);
+    this.decisionTimestamps = this.decisionTimestamps.filter((t) => now - t < 60000);
+    if (this.decisionTimestamps.length >= 5) {
+      const retryAfterMs = this.decisionTimestamps[0] + 60000 - now + 100;
+      return { allowed: false, retryAfterMs };
     }
     this.decisionTimestamps.push(now);
+    return { allowed: true };
   }
 
-  private checkNotificationRateLimit(): void {
+  private checkNotificationRateLimit(): { allowed: boolean; retryAfterMs?: number } {
     const now = Date.now();
-    this.notificationTimestamps = this.notificationTimestamps.filter(t => now - t < 1000);
-    if (this.notificationTimestamps.length >= this.maxNotificationsPerSecond) {
-      throw new Error(`通知频控: 每秒最多 ${this.maxNotificationsPerSecond} 条`);
+    this.notificationTimestamps = this.notificationTimestamps.filter((t) => now - t < 1000);
+    if (this.notificationTimestamps.length >= 3) {
+      const retryAfterMs = this.notificationTimestamps[0] + 1000 - now + 50;
+      return { allowed: false, retryAfterMs };
     }
     this.notificationTimestamps.push(now);
+    return { allowed: true };
   }
 
-  /** Send a decision request to human and block until reply or timeout */
+  // ── 决策请求 ──
+
   async requestDecision(question: string, options?: string[], timeoutMs?: number): Promise<string> {
-    this.checkDecisionRateLimit();
+    const check = this.checkDecisionRateLimit();
+    if (!check.allowed) throw new RateLimitError(check.retryAfterMs!);
+
     const id = crypto.randomUUID();
     const timeout = timeoutMs || config.defaultTimeoutMs;
+    const request: DecisionRequest = { id, question, options, timeoutMs: timeout, createdAt: Date.now() };
 
-    const request: DecisionRequest = {
-      id,
-      question,
-      options,
-      timeoutMs: timeout,
-      createdAt: Date.now(),
-    };
-
-    // Set up the pending entry BEFORE sending the IM message,
-    // so getPendingDecisions() works synchronously for the caller
     let resolveFn!: (answer: string) => void;
     let rejectFn!: (err: Error) => void;
     const promise = new Promise<string>((resolve, reject) => {
-      resolveFn = resolve;
-      rejectFn = reject;
+      resolveFn = resolve; rejectFn = reject;
     });
 
-    const timer = setTimeout(() => {
-      this.pending.delete(id);
-      rejectFn(new Error(`决策超时 (${Math.round(timeout / 1000)}s): "${question.slice(0, 80)}"`));
-    }, timeout);
+    const entry: PendingDecision = { request, resolve: resolveFn, reject: rejectFn };
+    await this.store.set(id, entry);
 
-    this.pending.set(id, { request, resolve: resolveFn, reject: rejectFn, timer });
-
-    // Now send the IM message — might fail, but pending is already tracked
+    const abortController = new AbortController();
     try {
-      await this.adapter.sendDecision(request);
-    } catch (err: any) {
-      clearTimeout(timer);
-      this.pending.delete(id);
-      throw new Error(`发送IM消息失败: ${err.message}`);
+      await Promise.race([
+        this.adapter.sendDecision(request, { signal: abortController.signal }).catch((err: any) => {
+          if (err.name === "AbortError") return;
+          throw err;
+        }),
+        new Promise<void>((_, reject) =>
+          setTimeout(() => {
+            abortController.abort();
+            reject(new Error("IM发送超时 (网关无响应)"));
+          }, SEND_TIMEOUT_MS)
+        ),
+      ]);
+
+      const timer = setTimeout(() => {
+        this.store.delete(id).catch((err) =>
+          console.error(`[bridge] 超时决策清理失败: ${err.message}`)
+        );
+        rejectFn(new Error(`决策超时 (${Math.round(timeout / 1000)}s): "${question.slice(0, 80)}"`));
+      }, timeout);
+      entry.timer = timer;
+
+    } catch (err) {
+      if (entry.timer) clearTimeout(entry.timer);
+      await this.store.delete(id).catch(() => {});
+      throw err;
     }
 
     return promise;
   }
 
-  /** Send a one-way notification, no reply expected */
+  // ── 通知 ──
+
   async sendMessage(text: string): Promise<void> {
-    this.checkNotificationRateLimit();
+    const check = this.checkNotificationRateLimit();
+    if (!check.allowed) throw new RateLimitError(check.retryAfterMs!);
     await this.adapter.sendNotification(text);
   }
 
-  /** Check bridge + adapter status */
-  getStatus(): { imType: string; ready: boolean; pendingCount: number; detail: any } {
-    const adapterStatus = (this.adapter as any).getStatus?.() || {};
+  // ── 状态查询 ──
+
+  async getStatus(): Promise<{ imType: string; ready: boolean; pendingCount: number; detail: any }> {
     return {
       imType: config.im.type,
-      ready: (this.adapter as any).isReady?.() ?? true,
-      pendingCount: this.pending.size,
-      detail: adapterStatus,
+      ready: this.adapter.isReady(),
+      pendingCount: await this.store.getSize(),
+      detail: this.adapter.getStatus(),
     };
   }
 
-  /** Get list of pending decisions */
-  getPendingDecisions(): { id: string; question: string; elapsedMs: number }[] {
+  async getPendingDecisions(): Promise<{ id: string; question: string; elapsedMs: number }[]> {
     const now = Date.now();
-    return Array.from(this.pending.values()).map((p) => ({
+    const entries = await this.store.getAll();
+    return entries.map(([, p]) => ({
       id: p.request.id,
       question: p.request.question,
       elapsedMs: now - p.request.createdAt,
     }));
   }
 
-  private handleReply(response: DecisionResponse): void {
-    if (this.pending.size === 0) return;
+  // ── 回复匹配 (异步化) ──
 
-    let matched: PendingDecision | undefined;
+  private async handleReply(response: DecisionResponse): Promise<void> {
+    try {
+      if (await this.store.getSize() === 0) return;
 
-    // Step 1: Try option-based matching (exact match on option value)
-    for (const [, pending] of this.pending) {
-      if (pending.request.options && pending.request.options.length > 0) {
-        if (pending.request.options.includes(response.answer)) {
-          matched = pending;
-          break;
+      let matched: PendingDecision | undefined;
+
+      // 1. decisionId 精确匹配
+      if (response.decisionId) {
+        matched = await this.store.get(response.decisionId);
+      }
+
+      // 2. 选项匹配
+      if (!matched) {
+        const entries = await this.store.getAll();
+        for (const [, pending] of entries) {
+          if (pending.request.options?.includes(response.answer)) {
+            matched = pending;
+            break;
+          }
         }
       }
-    }
 
-    // Step 2: If no option match, use FIFO (oldest pending)
-    if (!matched) {
-      const entries = Array.from(this.pending.entries());
-      entries.sort((a, b) => a[1].request.createdAt - b[1].request.createdAt);
-      if (entries.length > 0) {
-        matched = entries[0][1];
+      // 3. FIFO
+      if (!matched) {
+        const entries = await this.store.getAll();
+        entries.sort((a, b) => a[1].request.createdAt - b[1].request.createdAt);
+        if (entries.length > 0) matched = entries[0][1];
       }
-    }
 
-    if (matched) {
-      clearTimeout(matched.timer);
-      this.pending.delete(matched.request.id);
-      matched.resolve(response.answer);
+      if (matched) {
+        if (matched.timer) clearTimeout(matched.timer);
+        this.store.delete(matched.request.id).catch(() => {});
+        matched.resolve(response.answer);
+      }
+    } catch (err: any) {
+      console.error(`[bridge] handleReply 异常: ${err.message}`);
     }
   }
 }
