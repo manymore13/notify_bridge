@@ -25,7 +25,7 @@ export async function runInit() {
 
   if (imType === "feishu") {
     console.log("\n📋 飞书应用凭证:");
-    console.log("  在 https://open.feishu.cn 创建自建应用获取");
+    console.log("  🔗 没有应用? 一键创建: https://open.feishu.cn/app?createApp=1");
 
     if (!appId) appId = await ask("  App ID: ");
     else console.log(`  App ID: ${appId} (从环境变量读取)`);
@@ -79,11 +79,19 @@ export async function runInit() {
         }
 
         // Check event subscription
-        console.log("\n📡 事件订阅配置:");
-        console.log("  1. 打开 https://open.feishu.cn  → 你的应用 → 事件与回调");
-        console.log("  2. 订阅方式选「长连接」");
-        console.log("  3. 添加事件: im.message.receive_v1");
-        console.log("  4. 发布管理 → 创建版本并发布");
+        console.log("\n📡 检查事件订阅...");
+        const eventsOk = await checkEvents(token, appId);
+        if (!eventsOk) {
+          console.log("\n⚠️  事件订阅未配置! 请先完成以下步骤再继续:");
+          console.log(`  🔗 一键打开: https://open.feishu.cn/app/${appId}/events`);
+          console.log("  1. 订阅方式选「长连接」");
+          console.log("  2. 添加事件: im.message.receive_v1");
+          console.log("  3. 发布管理 → 创建版本并发布");
+          console.log("\n  完成后重新运行 `notify-bridge init`\n");
+          rl.close();
+          return;
+        }
+        console.log("  ✅ 事件订阅已配置!");
       }
     } catch (e: any) {
       console.log(`  ❌ 连接失败: ${e.message}`);
@@ -143,6 +151,29 @@ export async function runInit() {
   // 6. Done
   console.log("\n🎉 初始化完成! 重启 Claude Code 后即可使用。\n");
   rl.close();
+}
+
+/** Check if event subscription is configured for the app */
+async function checkEvents(token: string, appId: string): Promise<boolean> {
+  const H = { Authorization: `Bearer ${token}` };
+  try {
+    // Try to list event subscriptions
+    const r = await axios.get(
+      "https://open.feishu.cn/open-apis/event/v1/outbound/subscription/list",
+      { headers: H }
+    );
+    if (r.data?.code === 0) {
+      const items = r.data?.data?.items || [];
+      const hasMessageEvent = items.some((i: any) =>
+        i.event_type === "im.message.receive_v1"
+      );
+      return hasMessageEvent;
+    }
+    // API not available — likely events not configured at all
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 /** Test a single Feishu permission by trying the relevant API */
