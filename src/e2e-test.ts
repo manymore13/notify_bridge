@@ -17,7 +17,7 @@ async function main() {
 
   let bound = false;
   const checkInterval = setInterval(async () => {
-    const status = bridge.getStatus();
+    const status = await bridge.getStatus();
     if (status.ready && !bound) {
       bound = true;
       console.log("✅ 绑定成功！");
