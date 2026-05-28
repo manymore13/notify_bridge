@@ -24,7 +24,7 @@ export interface SendOptions {
 
 export interface IMBotAdapter {
   init(): Promise<void>;
-  start(callback: (response: DecisionResponse) => Promise<void>): Promise<void>;
+  start(callback: (response: DecisionResponse) => void): Promise<void>;
   stop(): Promise<void>;
   sendDecision(request: DecisionRequest, opts?: SendOptions): Promise<void>;
   sendNotification(message: string, opts?: SendOptions): Promise<void>;

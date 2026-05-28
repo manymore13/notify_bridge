@@ -6,7 +6,7 @@ export class TelegramAdapter implements IMBotAdapter {
   private botToken: string;
   private chatId: string;
   private allowedUserIds: Set<string>;
-  private onReplyCallback: ((r: DecisionResponse) => Promise<void>) | null = null;
+  private onReplyCallback: ((r: DecisionResponse) => void) | null = null;
 
   // 长轮询
   private polling = false;
@@ -38,7 +38,7 @@ export class TelegramAdapter implements IMBotAdapter {
     }
   }
 
-  async start(callback: (response: DecisionResponse) => Promise<void>): Promise<void> {
+  async start(callback: (response: DecisionResponse) => void): Promise<void> {
     this.onReplyCallback = callback;
     if (this.polling) return;
     this.polling = true;
@@ -115,7 +115,7 @@ export class TelegramAdapter implements IMBotAdapter {
             decisionId: `tg-${msg.message_id}`,
             answer: text,
             respondedAt: Date.now(),
-          })?.catch((err) => console.error(`[telegram] onReply 异常: ${err.message}`));
+          });
         }
       } catch (err: any) {
         if (err.name === "AbortError") return;

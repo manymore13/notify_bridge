@@ -17,7 +17,7 @@ const IDENTITY_INVALID_CODES = new Set([
 export class FeishuAdapter implements IMBotAdapter {
   private cfg: FeishuConfig;
   private channel: LarkChannel | null = null;
-  private onReply: ((r: DecisionResponse) => Promise<void>) | null = null;
+  private onReply: ((r: DecisionResponse) => void) | null = null;
 
   private authState = AuthState.UNBOUND;
   private lockedOpenId: string | null = null;
@@ -40,7 +40,7 @@ export class FeishuAdapter implements IMBotAdapter {
     this.loadBinding();
   }
 
-  async start(callback: (r: DecisionResponse) => Promise<void>): Promise<void> {
+  async start(callback: (r: DecisionResponse) => void): Promise<void> {
     this.onReply = callback;
     this.channel = createLarkChannel({
       appId: this.cfg.appId,
@@ -170,8 +170,7 @@ export class FeishuAdapter implements IMBotAdapter {
       if (!text) return;
 
       console.error(`[feishu] 📩 收到: "${text.slice(0, 50)}"`);
-      this.onReply?.({ decisionId: `fe-${msg.messageId || Date.now()}`, answer: text, respondedAt: Date.now() })
-        ?.catch((err) => console.error(`[feishu] onReply 异常: ${err.message}`));
+      this.onReply?.({ decisionId: `fe-${msg.messageId || Date.now()}`, answer: text, respondedAt: Date.now() });
     } catch (err: any) {
       console.error(`[feishu] 消息处理错误: ${err.message}`);
     }
@@ -187,9 +186,7 @@ export class FeishuAdapter implements IMBotAdapter {
       const decisionId = value.id || "";
 
       console.error(`[feishu] 🃏 卡片按钮: "${answer}" (${decisionId.slice(0, 8)})`);
-      // 立即 resolve, 不 await, 让 SDK 快速响应飞书 (3秒限制)
-      this.onReply?.({ decisionId, answer, respondedAt: Date.now() })
-        ?.catch((err) => console.error(`[feishu] onReply 异常: ${err.message}`));
+      this.onReply?.({ decisionId, answer, respondedAt: Date.now() });
     } catch (err: any) {
       console.error(`[feishu] 卡片处理错误: ${err.message}`);
     }

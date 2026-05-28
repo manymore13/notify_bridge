@@ -3,10 +3,10 @@ import type { IMBotAdapter, DecisionRequest, DecisionResponse, HealthStatus, Sen
 export class MockAdapter implements IMBotAdapter {
   public sendDecisionCalls: DecisionRequest[] = [];
   public sendNotificationCalls: string[] = [];
-  private callback: ((r: DecisionResponse) => Promise<void>) | null = null;
+  private callback: ((r: DecisionResponse) => void) | null = null;
 
   async init(): Promise<void> {}
-  async start(cb: (response: DecisionResponse) => Promise<void>): Promise<void> { this.callback = cb; }
+  async start(cb: (response: DecisionResponse) => void): Promise<void> { this.callback = cb; }
   async stop(): Promise<void> {}
 
   async sendDecision(request: DecisionRequest, _opts?: SendOptions): Promise<void> {

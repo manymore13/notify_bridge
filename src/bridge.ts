@@ -149,12 +149,12 @@ export class NotifyBridge {
   }
 
   async stop(): Promise<void> {
-    const all = await this.store.getAll();
-    for (const [, entry] of all) {
+    for (const [, entry] of this.pendingMap) {
       if (entry.timer) clearTimeout(entry.timer);
       entry.reject(new Error("Bridge shutting down"));
     }
-    await this.store.clear();
+    this.pendingMap.clear();
+    this.store.clear().catch(() => {});
     await this.adapter.stop();
   }
 
@@ -199,7 +199,8 @@ export class NotifyBridge {
     });
 
     const entry: PendingDecision = { request, resolve: resolveFn, reject: rejectFn };
-    await this.store.set(id, entry);
+    this.pendingMap.set(id, entry);                       // 同步 Map
+    await this.store.set(id, entry).catch(() => {});      // 持久化 (异步, 可失败)
 
     const abortController = new AbortController();
     try {
@@ -247,59 +248,61 @@ export class NotifyBridge {
     return {
       imType: config.im.type,
       ready: this.adapter.isReady(),
-      pendingCount: await this.store.getSize(),
+      pendingCount: this.pendingMap.size,
       detail: this.adapter.getStatus(),
     };
   }
 
   async getPendingDecisions(): Promise<{ id: string; question: string; elapsedMs: number }[]> {
     const now = Date.now();
-    const entries = await this.store.getAll();
-    return entries.map(([, p]) => ({
+    return Array.from(this.pendingMap.values()).map((p) => ({
       id: p.request.id,
       question: p.request.question,
       elapsedMs: now - p.request.createdAt,
     }));
   }
 
-  // ── 回复匹配 (异步化) ──
+  // ── 回复匹配 (同步 resolve, 异步清理) ──
 
-  private async handleReply(response: DecisionResponse): Promise<void> {
-    try {
-      if (await this.store.getSize() === 0) return;
+  /** 返回 void 而非 Promise<void>, SDK cardAction 不阻塞 */
+  private handleReply(response: DecisionResponse): void {
+    // 先收集所有 pending (同步遍历内存)
+    const entries = Array.from(this.pendingMap.entries());
 
-      let matched: PendingDecision | undefined;
+    if (entries.length === 0) return;
 
-      // 1. decisionId 精确匹配
-      if (response.decisionId) {
-        matched = await this.store.get(response.decisionId);
-      }
+    let matched: PendingDecision | undefined;
 
-      // 2. 选项匹配
-      if (!matched) {
-        const entries = await this.store.getAll();
-        for (const [, pending] of entries) {
-          if (pending.request.options?.includes(response.answer)) {
-            matched = pending;
-            break;
-          }
+    // 1. decisionId 精确匹配
+    if (response.decisionId) {
+      matched = this.pendingMap.get(response.decisionId);
+    }
+
+    // 2. 选项匹配
+    if (!matched) {
+      for (const [, pending] of entries) {
+        if (pending.request.options?.includes(response.answer)) {
+          matched = pending;
+          break;
         }
       }
+    }
 
-      // 3. FIFO
-      if (!matched) {
-        const entries = await this.store.getAll();
-        entries.sort((a, b) => a[1].request.createdAt - b[1].request.createdAt);
-        if (entries.length > 0) matched = entries[0][1];
-      }
+    // 3. FIFO
+    if (!matched) {
+      entries.sort((a, b) => a[1].request.createdAt - b[1].request.createdAt);
+      if (entries.length > 0) matched = entries[0][1];
+    }
 
-      if (matched) {
-        if (matched.timer) clearTimeout(matched.timer);
-        this.store.delete(matched.request.id).catch(() => {});
-        matched.resolve(response.answer);
-      }
-    } catch (err: any) {
-      console.error(`[bridge] handleReply 异常: ${err.message}`);
+    if (matched) {
+      if (matched.timer) clearTimeout(matched.timer);
+      this.pendingMap.delete(matched.request.id);
+      matched.resolve(response.answer);
+      // 持久化清理异步执行
+      this.store.delete(matched.request.id).catch(() => {});
     }
   }
+
+  // 内存 pending Map (同步查找, 同步 resolve)
+  private pendingMap = new Map<string, PendingDecision>();
 }
