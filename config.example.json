@@ -1,0 +1,9 @@
+{
+  "im": {
+    "type": "feishu",
+    "feishu": {
+      "appId": "cli_xxx"
+    }
+  },
+  "defaultTimeoutMs": 300000
+}

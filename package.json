@@ -1,0 +1,57 @@
+{
+  "name": "notify-bridge",
+  "version": "0.1.0",
+  "description": "MCP server bridging AI coding agents with IM (Feishu/Telegram) for human-in-the-loop decisions",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "notify-bridge": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "AGENT_INSTRUCTIONS.md",
+    "config.example.json",
+    ".env.example"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "prepublishOnly": "npm run build",
+    "test": "tsx src/test.ts && tsx src/integration-test.ts"
+  },
+  "keywords": [
+    "mcp",
+    "claude-code",
+    "feishu",
+    "lark",
+    "telegram",
+    "human-in-the-loop",
+    "ai-agent",
+    "notify",
+    "im-bridge",
+    "model-context-protocol"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/leiyanlian/notify-bridge"
+  },
+  "author": "leiyanlian",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.66.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "axios": "^1.7.0",
+    "express": "^4.21.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
