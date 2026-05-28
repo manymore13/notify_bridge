@@ -6,8 +6,12 @@ import axios from "axios";
 
 export async function runInit() {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  function ask(q: string): Promise<string> {
-    return new Promise((r) => rl.question(q, (a) => { r(a.trim()); }));
+  // 回车 = 使用默认值
+  function ask(q: string): Promise<string>;
+  function ask(q: string, def: string): Promise<string>;
+  function ask(q: string, def?: string): Promise<string> {
+    const prompt = def ? `${q} [${def}]: ` : `${q}: `;
+    return new Promise((r) => rl.question(prompt, (a) => { r(a.trim() || def || ""); }));
   }
 
   console.log("\n⚙️  notify-bridge 初始化向导\n");
@@ -29,9 +33,19 @@ export async function runInit() {
     }
   }
 
+  // Also read appSecret from MCP config env (previously saved by init)
+  let savedSecret = "";
+  const claudeJsonPath = join(homedir(), ".claude.json");
+  if (existsSync(claudeJsonPath)) {
+    try {
+      const claudeJson = JSON.parse(readFileSync(claudeJsonPath, "utf-8"));
+      savedSecret = claudeJson?.mcpServers?.["notify-bridge"]?.env?.FEISHU_APP_SECRET || "";
+    } catch {}
+  }
+
   // 1. IM type — pre-fill from existing config if available
   let appId = process.env.FEISHU_APP_ID || "";
-  let appSecret = process.env.FEISHU_APP_SECRET || "";
+  let appSecret = process.env.FEISHU_APP_SECRET || savedSecret || "";
   let imType = (existingConfig?.im?.type || process.env.BRIDGE_IM_TYPE || "") as string;
 
   if (imType) {
@@ -41,7 +55,7 @@ export async function runInit() {
     console.log("选择 IM 平台:");
     console.log("  1. 飞书 (Feishu)");
     console.log("  2. Telegram");
-    const imChoice = await ask("请选择 (1/2, 默认1): ");
+    const imChoice = await ask("选择平台 (1=飞书 2=Telegram)", "1");
     imType = imChoice === "2" ? "telegram" : "feishu";
   }
 
@@ -51,7 +65,7 @@ export async function runInit() {
     console.log("  🔗 没有应用? 一键创建: https://open.feishu.cn/app?createApp=1");
 
     if (appId) console.log(`  App ID: ${appId}`);
-    else appId = await ask("  App ID: ");
+    else appId = await ask("  App ID", "");
 
     if (appSecret) console.log("  App Secret: ***");
     else appSecret = await ask("  App Secret: ");
@@ -154,33 +168,41 @@ export async function runInit() {
   console.log(`\n✅ 配置已保存: ${configPath}`);
 
   // 5. Setup MCP
-  const needMCP = await confirm(ask, "\n配置 Claude Code MCP? (y/n, 默认y): ");
-  if (needMCP) {
-    console.log("  1. 用户级 (~/.claude.json, 所有项目)");
-    console.log("  2. 项目级 (./.mcp.json, 仅当前项目)");
-    const mcpScope = await ask("请选择 (1/2, 默认1): ");
-    const isGlobal = mcpScope !== "2";
-    const mcpConfigPath = isGlobal
-      ? join(homedir(), ".claude.json")
-      : join(process.cwd(), ".mcp.json");
-
-    let mcpConfig: any = {};
-    if (existsSync(mcpConfigPath)) {
-      try { mcpConfig = JSON.parse(readFileSync(mcpConfigPath, "utf-8")); } catch {}
-    }
-    mcpConfig.mcpServers = mcpConfig.mcpServers || {};
-    const prev = mcpConfig.mcpServers["notify-bridge"] || {};
-    mcpConfig.mcpServers["notify-bridge"] = {
-      command: "notify-bridge",
-      args: [],
-      env: appSecret ? { ...prev.env, FEISHU_APP_SECRET: appSecret } : prev.env,
-    };
-    writeFileSync(mcpConfigPath, JSON.stringify(mcpConfig, null, 2));
-    console.log(`✅ MCP 配置已写入: ${mcpConfigPath}`);
+  // Auto-save appSecret to MCP config so next init picks it up
+  if (appSecret) {
+    saveMcpConfig(appSecret, true); // default: global
   }
+
+  // 5. Setup MCP
+  console.log("\n🔌 Claude Code MCP 配置:");
+  console.log("  1. 用户级 (~/.claude.json, 所有项目) → 回车");
+  console.log("  2. 项目级 (./.mcp.json, 仅当前项目)");
+  const mcpScope = await ask("请选择", "1");
+  const isGlobal = mcpScope !== "2";
+  saveMcpConfig(appSecret, isGlobal);
 
   console.log("\n🎉 完成! 重启 Claude Code 后生效。\n");
   rl.close();
+}
+
+function saveMcpConfig(appSecret: string, isGlobal: boolean) {
+  const mcpConfigPath = isGlobal
+    ? join(homedir(), ".claude.json")
+    : join(process.cwd(), ".mcp.json");
+
+  let mcpConfig: any = {};
+  if (existsSync(mcpConfigPath)) {
+    try { mcpConfig = JSON.parse(readFileSync(mcpConfigPath, "utf-8")); } catch {}
+  }
+  mcpConfig.mcpServers = mcpConfig.mcpServers || {};
+  const prev = mcpConfig.mcpServers["notify-bridge"] || {};
+  mcpConfig.mcpServers["notify-bridge"] = {
+    command: "notify-bridge",
+    args: [],
+    env: appSecret ? { ...prev.env, FEISHU_APP_SECRET: appSecret } : prev.env,
+  };
+  writeFileSync(mcpConfigPath, JSON.stringify(mcpConfig, null, 2));
+  console.log(`✅ MCP 配置已写入: ${mcpConfigPath}`);
 }
 
 async function confirm(ask: (q: string) => Promise<string>, q: string): Promise<boolean> {
