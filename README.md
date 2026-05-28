@@ -74,15 +74,14 @@ notify-bridge init
 {
   "mcpServers": {
     "notify-bridge": {
-      "command": "node",
-      "args": ["D:/github/notify_bridge/dist/index.js"],
-      "cwd": "D:/github/notify_bridge"
+      "command": "npx",
+      "args": ["notify-bridge"]
     }
   }
 }
 ```
 
-或用命令行快速注册：
+或用命令行快速注册（自动写入正确路径）：
 
 ```bash
 notify-bridge setup             # 写入当前项目 .mcp.json
