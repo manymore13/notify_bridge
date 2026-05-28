@@ -71,9 +71,9 @@ export class FeishuAdapter implements IMBotAdapter {
     this.channel = null;
   }
 
-  async sendDecision(request: DecisionRequest, opts?: SendOptions): Promise<void> {
+  async sendDecision(request: DecisionRequest, _opts?: SendOptions): Promise<void> {
     this.ensureReady();
-    await this.sendImMessage("interactive", this.buildCard(request), opts);
+    await this.sendCardkitCard(request);
   }
 
   async sendNotification(message: string, opts?: SendOptions): Promise<void> {
@@ -215,6 +215,33 @@ export class FeishuAdapter implements IMBotAdapter {
     }
   }
 
+  /** 通过 CardKit 2.0 发送交互卡片 (支持长连接按钮回调) */
+  private async sendCardkitCard(request: DecisionRequest): Promise<void> {
+    if (!this.channel) throw new Error("Channel 未初始化");
+    const receiveId = this.capturedChatId || this.lockedOpenId || "";
+    const receiveIdType = this.capturedChatId ? "chat_id" : "open_id";
+
+    try {
+      // 1. 创建 CardKit 2.0 卡片模板
+      const cardJson = this.buildCardJson(request);
+      const created: any = await this.channel.rawClient.cardkit.v1.card.create({
+        data: { type: "card_json", data: JSON.stringify(cardJson) },
+      });
+      const cardId = created?.data?.card_id;
+      if (!cardId) throw new Error("cardkit.card.create 返回空 card_id");
+
+      // 2. 发送引用卡片的消息
+      const content = JSON.stringify({ type: "card", data: { card_id: cardId } });
+      await this.channel.rawClient.im.v1.message.create({
+        params: { receive_id_type: receiveIdType as any },
+        data: { receive_id: receiveId, msg_type: "interactive" as any, content },
+      });
+    } catch (err: any) {
+      console.error(`[feishu] CardKit 发送错误: ${err.message}`);
+      throw err;
+    }
+  }
+
   private async sendImMessage(msgType: string, content: string, opts?: SendOptions): Promise<void> {
     if (!this.channel) throw new Error("Channel 未初始化");
     const receiveId = this.capturedChatId || this.lockedOpenId || "";
@@ -264,7 +291,7 @@ export class FeishuAdapter implements IMBotAdapter {
 
   // ── 卡片 (带回传按钮, createLarkChannel 长连接支持 cardAction) ──
 
-  private buildCard(request: DecisionRequest): string {
+  private buildCardJson(request: DecisionRequest): object {
     const optionsText = request.options?.length
       ? `\n\n**选项**: ${request.options.join(" / ")}`
       : "";
@@ -299,10 +326,10 @@ export class FeishuAdapter implements IMBotAdapter {
       elements: [{ tag: "plain_text", content: `ID:${request.id.slice(0, 8)} — 可点按钮或直接回文字` }],
     });
 
-    return JSON.stringify({
+    return {
       config: { wide_screen_mode: true },
       header: { template: "blue", title: { tag: "plain_text" as const, content: "Agent Decision" } },
       elements,
-    });
+    };
   }
 }
