@@ -10,7 +10,7 @@
 
 **核心场景**: Agent 在编码过程中需要人类确认（删除文件、架构选型、危险操作等），但人不在电脑旁——Agent 通过 IM 发消息到人类手机，人类回复后 Agent 自动继续执行。
 
-**版本**: 0.4.0-draft | **最后更新**: 2026-05-28 | **状态**: 三轮架构评审中 (代码待同步)
+**版本**: 0.5.0-draft | **最后更新**: 2026-05-28 | **状态**: 四轮架构评审 (代码待同步)
 
 **通信模型**:
 
@@ -71,7 +71,7 @@ index.ts
 #### 数据结构 & 存储抽象 (v0.4.0: IDecisionStore)
 
 ```typescript
-// 存储接口抽象 — 进程重启无感知切换
+// 存储接口抽象 (v0.5.0: 增加事件钩子)
 interface IDecisionStore {
   get(id: string): PendingDecision | undefined;
   set(id: string, entry: PendingDecision): void;
@@ -79,6 +79,10 @@ interface IDecisionStore {
   getAll(): [string, PendingDecision][];
   get size(): number;
   clear(): void;
+
+  // v0.5.0 新增: 事件钩子
+  on(event: "recovered", callback: (entry: PendingDecision) => void): void;
+  on(event: "expired",  callback: (entry: PendingDecision) => void): void;
 }
 
 // 默认实现: 纯内存 (当前行为)
@@ -117,11 +121,112 @@ class NotifyBridge {
 }
 ```
 
-**重启恢复语义**:
-- 进程重启 → `FileDecisionStore` 从 `pending.json` 恢复所有未超时决策
-- 已超时的决策 → 自动清理，不恢复（超时时间已过，无意义）
-- Promise 无法恢复（JS 限制）→ 恢复后立即 reject 并返回 `status: "recovered_after_restart"`
-- Agent 收到恢复后的错误 → 知道决策曾挂起但已失效 → 重新发起或继续
+**重启恢复 & Timer 重新绑定 (v0.5.0 修复僵尸决策)**:
+
+v0.4.0 致命遗漏: `loadFromDisk()` 恢复决策后没有重新绑定 `setTimeout`。
+定时器是 JS 运行时对象，无法被 `JSON.stringify` 序列化。
+如果不重新绑定，恢复后的决策永远不会触发超时 → 变成 "僵尸挂起"，永久占用内存和磁盘。
+
+```typescript
+class FileDecisionStore implements IDecisionStore {
+
+  loadFromDisk(onRecovered: (entry: PendingDecision) => void): PendingDecision[] {
+    const raw = JSON.parse(readFileSync(this.filePath, "utf-8"));
+    const now = Date.now();
+    const recovered: PendingDecision[] = [];
+
+    for (const item of raw) {
+      const elapsed = now - item.createdAt;
+      const remaining = item.timeoutMs - elapsed;
+
+      if (remaining <= 0) {
+        // 已超时 → 直接清理，不恢复
+        continue;
+      }
+
+      // 重建 PendingDecision (Promise 不可恢复 → 使用 onRecovered 回调通知)
+      const entry = this.rebuildEntry(item);
+      recovered.push(entry);
+
+      // ⚠️ 关键: 通知 NotifyBridge 为这个决策重新绑定 setTimeout
+      onRecovered(entry);
+    }
+
+    this.flushToDisk();  // 清理已超时的条目
+    return recovered;
+  }
+}
+
+// NotifyBridge 启动时:
+async start() {
+  if (this.store instanceof FileDecisionStore) {
+    this.store.loadFromDisk((entry) => {
+      // 为恢复的决策重新绑定定时器
+      const remaining = entry.request.timeoutMs -
+        (Date.now() - entry.request.createdAt);
+
+      if (remaining <= 0) {
+        this.store.delete(entry.request.id);
+        return;
+      }
+
+      const timer = setTimeout(() => {
+        this.store.delete(entry.request.id);
+        entry.reject(new Error("决策超时 (恢复后)"));
+      }, remaining);
+
+      entry.timer = timer;  // ← 重新绑定!
+    });
+  }
+  // ...
+}
+```
+
+**恢复语义**:
+- 进程重启 → `loadFromDisk` 遍历 pending.json
+- 已过期决策 → 跳过 (不恢复)
+- 未过期决策 → 重建对象 + 通知 NotifyBridge 重新绑定 `setTimeout`
+- Promise 不可恢复 → 恢复后 entry.resolve/reject 为空函数占位 + 决策标记为 `recovered: true`
+- Agent 调用 `check_pending` 时看到 `recovered: true` → 知道这是重启遗留
+- 人类回复时 → `handleReply` 正常 resolve（占位函数无实际 Agent 接收方）
+  → 但回复会被记录 + `flushToDisk` 标记为 `resolved`
+
+**事件驱动的恢复通知**:
+
+```typescript
+// NotifyBridge 启动时注册事件监听:
+async start() {
+  // 监听持久化恢复事件
+  this.store.on("recovered", (entry) => {
+    const remaining = entry.request.timeoutMs - (Date.now() - entry.request.createdAt);
+    if (remaining <= 0) {
+      this.store.delete(entry.request.id);
+      return;
+    }
+    // 重新绑定定时器
+    const timer = setTimeout(() => {
+      this.store.delete(entry.request.id);
+      entry.reject(new Error("决策超时 (恢复后)"));
+    }, remaining);
+    entry.timer = timer;
+    console.log(`[bridge] 恢复决策: ${entry.request.id.slice(0, 8)} 剩余 ${Math.round(remaining/1000)}s`);
+  });
+
+  this.store.on("expired", (entry) => {
+    // 过期决策直接丢弃
+    this.store.delete(entry.request.id);
+  });
+
+  // 触发持久化恢复 (FileDecisionStore 实现会 emit "recovered" 事件)
+  await this.adapter.init();
+  await this.adapter.start((response) => this.handleReply(response));
+}
+```
+
+**事件驱动 vs 回调**:
+- 回调方案 (`loadFromDisk(onRecovered)`) → 同步、单向、一次性
+- 事件方案 (`on("recovered", cb)`) → 解耦、可多个监听者、可在运行中动态触发
+- v0.5.0 选择事件方案，因为恢复事件可能在进程生命周期的任意时刻发生 (如热重载)
 
 **关键属性**: 默认 `MemoryDecisionStore` 保持现有行为。
 `FileDecisionStore` 为可选增强，通过配置 `BRIDGE_PERSISTENT_STORE=true` 启用。
@@ -473,29 +578,43 @@ function handleMessageEvent(data): void {
 // bridge_reset 工具: 清空 lockedOpenId + lockedUserId + pending
 // Agent 可调用或人类在飞书发 "!reset" 指令触发
 
-// 方案3: 健康自愈 (v0.4.0)
+// 方案3: 精准自愈 (v0.5.0: 仅身份失效错误码解锁)
 // checkHealth() 连续 N 次发送失败 (code != 0, 如 user_not_found)
 // → 自动解锁 + 日志告警 + 等待重新绑定
-private consecutiveSendFailures = 0;
-private readonly MAX_SEND_FAILURES = 3;
+// v0.5.0: 仅身份失效错误码才累计，网络错误不解锁
+private static readonly IDENTITY_INVALID_CODES = new Set([
+  "user_not_found", "chat_not_found",
+  "no_permission", "receive_id_not_authorized",
+]);
+private identityFailures = 0;
 
 private async sendImMessage(...): Promise<void> {
-  const res = await axios.post(...);
-  if (res.data?.code === 0) {
-    this.consecutiveSendFailures = 0;
-  } else {
-    this.consecutiveSendFailures++;
-    if (this.consecutiveSendFailures >= this.MAX_SEND_FAILURES) {
-      console.error(`[feishu] 连续 ${this.MAX_SEND_FAILURES} 次发送失败，自动解锁身份`);
-      this.lockedOpenId = null;
-      this.capturedChatId = null;
-      this.consecutiveSendFailures = 0;
+  try {
+    const res = await axios.post(...);
+    if (res.data?.code === 0) { this.identityFailures = 0; return; }
+
+    const errorType = res.data?.msg || "";
+    if (FeishuAdapter.IDENTITY_INVALID_CODES.has(errorType)) {
+      this.identityFailures++;
+      if (this.identityFailures >= 3) {
+        console.error(`[feishu] 身份失效 (${errorType})，自动解锁`);
+        this.lockedOpenId = null;
+        this.capturedChatId = null;
+        this.identityFailures = 0;
+      }
     }
+    // 网络/限流/超时 → 不累计，不解锁
+  } catch (err) {
+    console.warn(`[feishu] 网络错误 (不触发解锁): ${err.message}`);
   }
 }
 ```
 
-**重置策略**: 进程重启自动重置 + 连续发送失败自动解锁 + 可选 MCP 工具手动重置。
+**重置策略**:
+- 进程重启 → 自动重置 (内存清空)
+- 身份失效错误码 × 3 → 自动解锁 (仅 user_not_found 等特定码)
+- 网络错误 / 限流 (429) / 超时 → 仅告警，不解锁
+- 可选 `bridge_reset` MCP 工具 → 手动重置
 
 #### Token 管理 (v0.2.0 已修复缓存)
 
@@ -702,6 +821,36 @@ interface IMBotAdapter {
   getStatus?(): Record<string, any>;       // 适配器特定状态
 }
 ```
+
+#### init() vs start() 职责分离 (v0.5.0 明确语义)
+
+v0.4.0 的问题: 飞书把所有逻辑塞进 `start()`，Telegram 把长轮询死循环塞进 `start()`。
+两个适配器的职责分层不一致，外层控制代码无法可靠地在 `init()` 之后执行自检。
+
+v0.5.0 严格规定单一职责:
+
+| 阶段 | 职责 | 飞书 | Telegram |
+|------|------|------|----------|
+| `init()` | 建立连接 & 鉴权 | `new WSClient` + 等待 `open` | `getMe()` 探活 |
+| `start(cb)` | 使能监听，分发事件 | 存储 cb (连接已就绪) | `while(polling)` 循环 |
+| `checkHealth()` | 健康探针 | WS === OPEN && Token 有效 | 30s内 getUpdates 成功 |
+
+**NotiftyBridge 启动流程规范化**:
+
+```typescript
+async start() {
+  this.setupStoreEvents();          // 1. 恢复持久化状态
+  await this.adapter.init();         // 2. 建立连接 & 鉴权
+  if (adapter.checkHealth) {         // 3. 连接就绪后自检
+    const h = await adapter.checkHealth();
+    if (h.status === "unhealthy") throw new Error(h.reason);
+  }
+  await this.adapter.start(cb);      // 4. 一切就绪，使能流量
+}
+```
+
+**执行保证**: `init()` 返回后 WebSocket 必须是 CONNECTED / Telegram API 至少成功探活过一次。
+`start()` 仅负责解封流量，不负责建立连接。
 
 #### bridge_status 改造
 
@@ -972,20 +1121,28 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | 频控死锁 (抛异常 → 重试) | ✅ |
 | 文档 6.3 节逻辑冲突 | ✅ |
 
-### 7.4 v0.4.0 规划修复项
+### 7.4 v0.4.0 规划修复项 (全部完成)
 
 | 限制 | 状态 |
 |------|------|
-| backoff 阻塞导致 stdio 死锁 | ✅ 返回 retry_after_ms, Agent 侧 sleep |
-| lockedOpenId 永久失效 | ✅ 连续失败自动解锁 + 进程重启重置 |
-| pending 无持久化 | ✅ IDecisionStore 抽象 + FileDecisionStore |
-| 适配器无统一生命周期 | ✅ init/checkHealth/isReady 规范 |
+| backoff 阻塞导致 stdio 死锁 | ✅ |
+| lockedOpenId 永久失效 | ✅ |
+| pending 无持久化 | ✅ |
+| 适配器无统一生命周期 | ✅ |
 
-### 7.5 仍存在的限制
+### 7.5 v0.5.0 规划修复项
+
+| 限制 | 状态 |
+|------|------|
+| FileDecisionStore 重启后 Timer 丢失 → 僵尸决策 | ✅ 恢复后重新绑定 setTimeout |
+| 自愈算法网络抖动误杀 | ✅ 仅 IDENTITY_INVALID_CODES 触发解锁 |
+| IDecisionStore 缺乏事件通知 | ✅ on("recovered"/"expired") 事件钩子 |
+| init/start 职责混淆 | ✅ init=连接, start=监听 语义分离 |
+
+### 7.6 仍存在的限制
 
 | 限制 | 影响 | 优先级 |
 |------|------|--------|
-| FileDecisionStore 恢复语义 | 重启后 Promise 不可恢复，需 reject + 通知 | 低 |
 | 文本回复无法关联 decisionId | 纯文本降级到选项匹配 + warning | 低 |
 | IM 身份依赖平台保证 | 理论上 open_id/from.id 可伪造 | 极低 |
 
@@ -1030,6 +1187,7 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | 0.3.0-draft | 2026-05-28 | 架构评审: 用户锁定+白名单、decisionId精确匹配、send超时保护、移除express、向上查找配置 |
 | 0.3.1-draft | 2026-05-28 | 二轮评审: 卡片点击安全校验、Telegram from.id验证、频控backoff防死锁、文本错位文档修正 |
 | 0.4.0-draft | 2026-05-28 | 三轮评审: 频控改为retry_after不阻塞stdio、lockedOpenId自愈重置、IDecisionStore持久化抽象、适配器生命周期规范化 |
+| 0.5.0-draft | 2026-05-28 | 四轮评审: 重启Timer重绑定、自愈精准错误码防误杀、IDecisionStore事件驱动、init/start职责分离 |
 
 ## 11. 评审记录
 
@@ -1038,6 +1196,7 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | 2026-05-28 | 一轮 | 不通过→修复后通过 | 5项: open_id覆盖、并发错位、发送死锁、express冗余、cwd绑定 |
 | 2026-05-28 | 二轮 | Conditionally Approved → 通过 | 4项: 卡片点击绕过白名单、文本错位文档冲突、Telegram群组劫持、频控死锁 |
 | 2026-05-28 | 三轮 | Conditional Disapproval → 待修复 | 4项: backoff阻塞stdio致命Bug、lockedOpenId假死、无持久化抽象、适配器无生命周期 |
+| 2026-05-28 | 四轮 | Pass with Revision → 小修后发布 | 4项: 重启Timer丢失僵尸决策、自愈误杀、存储无事件通知、init/start职责混淆 |
 
 ## 12. 总结
 
