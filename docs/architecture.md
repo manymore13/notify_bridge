@@ -10,7 +10,7 @@
 
 **核心场景**: Agent 在编码过程中需要人类确认（删除文件、架构选型、危险操作等），但人不在电脑旁——Agent 通过 IM 发消息到人类手机，人类回复后 Agent 自动继续执行。
 
-**版本**: 0.7.0 | **最后更新**: 2026-05-28 | **状态**: 已封版 (Approved for Production)
+**版本**: 0.8.0 | **最后更新**: 2026-05-28 | **状态**: 六轮评审修复 (代码待同步)
 
 **通信模型**:
 
@@ -72,7 +72,9 @@ index.ts
 
 ```typescript
 // 存储接口抽象 (v0.6.0: 全面异步化 + 事件钩子)
-interface IDecisionStore extends EventEmitter {
+// v0.8.0: 不 extends EventEmitter — 解耦 Node.js 运行时依赖
+// 实现类自行选择继承 EventEmitter 或手动管理回调列表
+interface IDecisionStore {
   get(id: string): Promise<PendingDecision | undefined>;
   set(id: string, entry: PendingDecision): Promise<void>;
   delete(id: string): Promise<boolean>;
@@ -80,9 +82,9 @@ interface IDecisionStore extends EventEmitter {
   getSize(): Promise<number>;
   clear(): Promise<void>;
 
-  // 事件钩子
-  on(event: "recovered", callback: (entry: PendingDecision) => void): this;
-  on(event: "expired",  callback: (entry: PendingDecision) => void): this;
+  // 显式声明事件方法签名，不依赖 Node.js 内置类
+  on(event: "recovered" | "expired", cb: (entry: PendingDecision) => void): this;
+  off(event: "recovered" | "expired", cb: (entry: PendingDecision) => void): this;
 }
 
 // 默认实现: 纯内存 (当前行为)
@@ -92,6 +94,7 @@ class MemoryDecisionStore implements IDecisionStore {
 }
 
 // 可选实现: 文件持久化 (v0.6.0: 异步 + 防并发写入锁)
+// v0.8.0: FileDecisionStore 自行选择继承 EventEmitter (仅 Node.js 平台)
 class FileDecisionStore extends EventEmitter implements IDecisionStore {
   private map = new Map<string, PendingDecision>();
   private filePath: string;
@@ -169,106 +172,46 @@ v0.4.0 致命遗漏: `loadFromDisk()` 恢复决策后没有重新绑定 `setTime
 定时器是 JS 运行时对象，无法被 `JSON.stringify` 序列化。
 如果不重新绑定，恢复后的决策永远不会触发超时 → 变成 "僵尸挂起"，永久占用内存和磁盘。
 
-```typescript
-class FileDecisionStore implements IDecisionStore {
+**唯一方案: 事件驱动恢复 (v0.5.0 确定, v0.8.0 清除冗余)**:
 
-  loadFromDisk(onRecovered: (entry: PendingDecision) => void): PendingDecision[] {
-    const raw = JSON.parse(readFileSync(this.filePath, "utf-8"));
-    const now = Date.now();
-    const recovered: PendingDecision[] = [];
-
-    for (const item of raw) {
-      const elapsed = now - item.createdAt;
-      const remaining = item.timeoutMs - elapsed;
-
-      if (remaining <= 0) {
-        // 已超时 → 直接清理，不恢复
-        continue;
-      }
-
-      // 重建 PendingDecision (Promise 不可恢复 → 使用 onRecovered 回调通知)
-      const entry = this.rebuildEntry(item);
-      recovered.push(entry);
-
-      // ⚠️ 关键: 通知 NotifyBridge 为这个决策重新绑定 setTimeout
-      onRecovered(entry);
-    }
-
-    this.flushToDisk();  // 清理已超时的条目
-    return recovered;
-  }
-}
-
-// NotifyBridge 启动时:
-async start() {
-  if (this.store instanceof FileDecisionStore) {
-    this.store.loadFromDisk((entry) => {
-      // 为恢复的决策重新绑定定时器
-      const remaining = entry.request.timeoutMs -
-        (Date.now() - entry.request.createdAt);
-
-      if (remaining <= 0) {
-        this.store.delete(entry.request.id);
-        return;
-      }
-
-      const timer = setTimeout(() => {
-        this.store.delete(entry.request.id);
-        entry.reject(new Error("决策超时 (恢复后)"));
-      }, remaining);
-
-      entry.timer = timer;  // ← 重新绑定!
-    });
-  }
-  // ...
-}
-```
-
-**恢复语义**:
-- 进程重启 → `loadFromDisk` 遍历 pending.json
-- 已过期决策 → 跳过 (不恢复)
-- 未过期决策 → 重建对象 + 通知 NotifyBridge 重新绑定 `setTimeout`
-- Promise 不可恢复 → 恢复后 entry.resolve/reject 为空函数占位 + 决策标记为 `recovered: true`
-- Agent 调用 `check_pending` 时看到 `recovered: true` → 知道这是重启遗留
-- 人类回复时 → `handleReply` 正常 resolve（占位函数无实际 Agent 接收方）
-  → 但回复会被记录 + `flushToDisk` 标记为 `resolved`
-
-**事件驱动的恢复通知**:
+`FileDecisionStore.loadFromDisk()` 不接受回调参数，通过 emit 事件通知外层。
+`NotifyBridge.start()` 在 `init()` 之前注册事件监听器，确保 `loadFromDisk()` 触发的
+`recovered` 事件能被捕获并重新绑定 `setTimeout`。
 
 ```typescript
-// NotifyBridge 启动时注册事件监听:
+// FileDecisionStore: 恢复时 emit 事件
+async loadFromDisk(): Promise<void> {
+  const raw = JSON.parse(await fs.readFile(this.filePath, "utf-8"));
+  const now = Date.now();
+  for (const item of raw) {
+    const remaining = item.timeoutMs - (now - item.createdAt);
+    if (remaining <= 0) { this.emit("expired", item); continue; }
+    const entry = this.rebuildEntry(item);
+    this.map.set(item.id, entry);
+    this.emit("recovered", entry);  // ← 事件通知, 非回调
+  }
+  await this.flushToDisk();
+}
+
+// NotifyBridge.start(): 先注册事件, 再触发恢复
 async start() {
-  // 监听持久化恢复事件
   this.store.on("recovered", (entry) => {
     const remaining = entry.request.timeoutMs - (Date.now() - entry.request.createdAt);
-    if (remaining <= 0) {
-      this.store.delete(entry.request.id);
-      return;
-    }
-    // 重新绑定定时器
-    const timer = setTimeout(() => {
-      this.store.delete(entry.request.id);
+    if (remaining <= 0) { await this.store.delete(entry.request.id); return; }
+    entry.timer = setTimeout(async () => {
+      await this.store.delete(entry.request.id);
       entry.reject(new Error("决策超时 (恢复后)"));
     }, remaining);
-    entry.timer = timer;
-    console.log(`[bridge] 恢复决策: ${entry.request.id.slice(0, 8)} 剩余 ${Math.round(remaining/1000)}s`);
   });
-
   this.store.on("expired", (entry) => {
-    // 过期决策直接丢弃
     this.store.delete(entry.request.id);
   });
 
-  // 触发持久化恢复 (FileDecisionStore 实现会 emit "recovered" 事件)
   await this.adapter.init();
   await this.adapter.start((response) => this.handleReply(response));
+  // loadFromDisk 在 init 内部或之后由 store 自身触发
 }
 ```
-
-**事件驱动 vs 回调**:
-- 回调方案 (`loadFromDisk(onRecovered)`) → 同步、单向、一次性
-- 事件方案 (`on("recovered", cb)`) → 解耦、可多个监听者、可在运行中动态触发
-- v0.5.0 选择事件方案，因为恢复事件可能在进程生命周期的任意时刻发生 (如热重载)
 
 **关键属性**: 默认 `MemoryDecisionStore` 保持现有行为。
 `FileDecisionStore` 为可选增强，通过配置 `BRIDGE_PERSISTENT_STORE=true` 启用。
@@ -501,9 +444,33 @@ async ({ question, options, timeout_ms }) => {
 
 **关键**: MCP Server 自身不做任何阻塞等待，始终立即返回。由 Agent 在其运行周期内执行 sleep，释放 stdio 通道。
 
-#### getStatus() / getPendingDecisions()
+#### getStatus() / getPendingDecisions() (v0.8.0: 异步化)
 
-只读方法，暴露内部状态用于 MCP 工具。无副作用。
+```typescript
+// v0.8.0: IDecisionStore 异步化后，getPendingDecisions 必须改为 async
+async getPendingDecisions(): Promise<{ id: string; question: string; elapsedMs: number }[]> {
+  const now = Date.now();
+  const entries = await this.store.getAll();  // ← await
+  return entries.map(([, pending]) => ({
+    id: pending.request.id,
+    question: pending.request.question,
+    elapsedMs: now - pending.request.createdAt,
+  }));
+}
+
+getStatus(): { imType: string; ready: boolean; pendingCount: number; detail: any } {
+  // getStatus 保持同步 — ready/pendingCount 基于内存计数器
+  const adapterStatus = (this.adapter as any).getStatus?.() || {};
+  return {
+    imType: config.im.type,
+    ready: (this.adapter as any).isReady?.() ?? true,
+    pendingCount: this.pendingCount,    // 同步计数器
+    detail: adapterStatus,
+  };
+}
+```
+
+`bridge_status` 工具中 await 调用：`const pending = await bridge.getPendingDecisions()`。
 
 ---
 
@@ -803,6 +770,14 @@ function handleCardAction(data): void {
     return;
   }
 
+  // v0.8.0 修复: 首次点击触发锁定 (与 handleMessageEvent 行为一致)
+  // 修复前: 用户只点卡片不发文字 → lockedOpenId 永远为 null → 任何人点卡片都通过
+  if (!this.lockedOpenId && operatorOpenId) {
+    this.lockedOpenId = operatorOpenId;
+    this.authState = AuthState.BOUND_LOCKED;
+    console.log(`[feishu] 🔒 卡片点击锁定用户: ${operatorOpenId}`);
+  }
+
   // 安全校验通过，解析按钮值
   const raw = data.event?.action?.value || data.action?.value;
   let decisionId = "", answer = raw;
@@ -951,20 +926,30 @@ interface HealthStatus {
   details?: Record<string, any>;
 }
 
+// v0.8.0: abstract base class 替代可选方法
+abstract class BaseBotAdapter implements IMBotAdapter {
+  // ── 子类必须实现 ──
+  abstract init(): Promise<void>;
+  abstract start(callback: (r: DecisionResponse) => void): Promise<void>;
+  abstract stop(): Promise<void>;
+  abstract sendDecision(req: DecisionRequest, opts?: { signal?: AbortSignal }): Promise<void>;
+  abstract sendNotification(message: string): Promise<void>;
+
+  // ── 有默认实现，可覆盖 ──
+  async checkHealth(): Promise<HealthStatus> { return { status: "healthy" }; }
+  isReady(): boolean { return true; }
+  getStatus(): Record<string, any> { return {}; }
+}
+
 interface IMBotAdapter {
-  // ── 生命周期钩子 ──
-  init(): Promise<void>;                                     // 初始化: 连接、认证
-  start(callback: (r: DecisionResponse) => void): Promise<void>; // 开始监听
-  stop(): Promise<void>;                                     // 停止 & 清理
-
-  // ── 消息发送 ──
-  sendDecision(request: DecisionRequest): Promise<void>;
+  init(): Promise<void>;
+  start(callback: (r: DecisionResponse) => void): Promise<void>;
+  stop(): Promise<void>;
+  sendDecision(req: DecisionRequest, opts?: { signal?: AbortSignal }): Promise<void>;
   sendNotification(message: string): Promise<void>;
-
-  // ── 可观测性 (v0.4.0 新增) ──
-  checkHealth?(): Promise<HealthStatus>;   // 健康探针
-  isReady?(): boolean;                     // 是否有合法的发送目标
-  getStatus?(): Record<string, any>;       // 适配器特定状态
+  checkHealth(): Promise<HealthStatus>;
+  isReady(): boolean;
+  getStatus(): Record<string, any>;
 }
 ```
 
@@ -1007,14 +992,16 @@ async start() {
 async () => {
   const health = adapter.checkHealth
     ? await adapter.checkHealth()
-    : { status: "healthy" as const, reason: "adapter does not implement checkHealth" };
+    : { status: "healthy" as const, reason: "adapter health check" };
+
+  const pendingDecisions = await bridge.getPendingDecisions();  // v0.8.0: await
 
   return {
     content: [{ type: "text", text: JSON.stringify({
       im_type: config.im.type,
       adapter_health: health,
       ready: adapter.isReady?.() ?? true,
-      pending_count: bridge.getPendingDecisions().length,
+      pending_count: pendingDecisions.length,
       store_type: store instanceof FileDecisionStore ? "file" : "memory",
     }) }],
   };
@@ -1336,6 +1323,7 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | 0.5.0-draft | 2026-05-28 | 四轮评审: 重启Timer重绑定、自愈精准错误码防误杀、IDecisionStore事件驱动、init/start职责分离 |
 | 0.6.0-draft | 2026-05-28 | 五轮评审: Telegram start()去阻塞、AbortController防崩溃、Store异步化+写锁、PENDING_REBIND安全状态机 |
 | 0.7.0 | 2026-05-28 | 封版: stop()适配IDecisionStore异步API、Telegram轮询AbortController优雅退出 |
+| 0.8.0 | 2026-05-28 | 六轮评审: handleCardAction锁定、bridge_status await、清除回调冗余、IDecisionStore解耦EventEmitter、BaseBotAdapter基类 |
 
 ## 11. 评审记录
 
@@ -1347,6 +1335,7 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | 2026-05-28 | 四轮 | Pass with Revision → 小修后发布 | 4项: 重启Timer丢失、自愈误杀、存储无事件、init/start混淆 |
 | 2026-05-28 | 五轮 | Pass with Revision → 趋于完美 | 4项: Telegram死循环、UnhandledRejection、Store同步I/O、解锁劫持 |
 | 2026-05-28 | 终审 | Approved for Production ✅ | 2项微瑕: stop()旧API残留、Telegram轮询非优雅退出 |
+| 2026-05-28 | 六轮 | Conditional Disapproval → 修复后通过 | 3Bug: stop()旧引用、bridge_status缺await、卡片不锁定; 3架构: 回调冗余、EventEmitter耦合、可选方法碎片化 |
 
 ## 12. 总结
 
