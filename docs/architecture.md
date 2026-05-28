@@ -10,7 +10,7 @@
 
 **核心场景**: Agent 在编码过程中需要人类确认（删除文件、架构选型、危险操作等），但人不在电脑旁——Agent 通过 IM 发消息到人类手机，人类回复后 Agent 自动继续执行。
 
-**版本**: 0.8.0 | **最后更新**: 2026-05-28 | **状态**: 六轮评审修复 (代码待同步)
+**版本**: 0.9.0 | **最后更新**: 2026-05-28 | **状态**: 正式封版 (Approved for Production)
 
 **通信模型**:
 
@@ -198,8 +198,11 @@ async start() {
   this.store.on("recovered", (entry) => {
     const remaining = entry.request.timeoutMs - (Date.now() - entry.request.createdAt);
     if (remaining <= 0) { await this.store.delete(entry.request.id); return; }
-    entry.timer = setTimeout(async () => {
-      await this.store.delete(entry.request.id);
+    entry.timer = setTimeout(() => {
+      // ⚠️ setTimeout 不会 await 回调, 必须 try/catch 防 UnhandledRejection
+      this.store.delete(entry.request.id).catch(err =>
+        console.error(`[bridge] 恢复决策清理失败: ${err.message}`)
+      );
       entry.reject(new Error("决策超时 (恢复后)"));
     }, remaining);
   });
@@ -1324,6 +1327,7 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | 0.6.0-draft | 2026-05-28 | 五轮评审: Telegram start()去阻塞、AbortController防崩溃、Store异步化+写锁、PENDING_REBIND安全状态机 |
 | 0.7.0 | 2026-05-28 | 封版: stop()适配IDecisionStore异步API、Telegram轮询AbortController优雅退出 |
 | 0.8.0 | 2026-05-28 | 六轮评审: handleCardAction锁定、bridge_status await、清除回调冗余、IDecisionStore解耦EventEmitter、BaseBotAdapter基类 |
+| 0.9.0 | 2026-05-28 | 正式封版: setTimeout防UnhandledRejection、EventEmitter组合替代继承、代码落地注意事项 |
 
 ## 11. 评审记录
 
@@ -1335,9 +1339,57 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | 2026-05-28 | 四轮 | Pass with Revision → 小修后发布 | 4项: 重启Timer丢失、自愈误杀、存储无事件、init/start混淆 |
 | 2026-05-28 | 五轮 | Pass with Revision → 趋于完美 | 4项: Telegram死循环、UnhandledRejection、Store同步I/O、解锁劫持 |
 | 2026-05-28 | 终审 | Approved for Production ✅ | 2项微瑕: stop()旧API残留、Telegram轮询非优雅退出 |
-| 2026-05-28 | 六轮 | Conditional Disapproval → 修复后通过 | 3Bug: stop()旧引用、bridge_status缺await、卡片不锁定; 3架构: 回调冗余、EventEmitter耦合、可选方法碎片化 |
+| 2026-05-28 | 六轮 | Conditional Disapproval → 修复后通过 | 3Bug + 3架构 |
+| 2026-05-28 | 终审 | Approved for Production ✅ | 2微瑕: setTimeout回调异常、EventEmitter类型冲突 (代码级备忘) |
 
-## 12. 总结
+## 12. 代码落地注意事项 (v0.9.0)
+
+架构层面已无硬伤，以下为代码编写时的微观注意事项：
+
+### 12.1 setTimeout 异步回调防崩溃
+
+```typescript
+// ❌ 错误: setTimeout 的 async 回调抛异常 → UnhandledPromiseRejection → 进程崩溃
+entry.timer = setTimeout(async () => {
+  await this.store.delete(entry.request.id);
+}, remaining);
+
+// ✅ 正确: .catch() 吞掉异常, 确保进程不被回调内部错误杀死
+entry.timer = setTimeout(() => {
+  this.store.delete(entry.request.id).catch(err =>
+    console.error(`[bridge] 清理失败: ${err.message}`)
+  );
+}, remaining);
+```
+
+### 12.2 EventEmitter 继承时的 TypeScript 类型冲突
+
+`FileDecisionStore` 若直接 `extends EventEmitter implements IDecisionStore`，
+在严格模式下 `EventEmitter.on(string|symbol, (...any[]) => void)` 与
+`IDecisionStore.on("recovered"|"expired", (PendingDecision) => void)` 签名不兼容。
+
+**推荐方案: 组合替代继承**：
+
+```typescript
+class FileDecisionStore implements IDecisionStore {
+  private emitter = new EventEmitter();  // 组合, 不继承
+
+  on(event: "recovered" | "expired", cb: (entry: PendingDecision) => void): this {
+    this.emitter.on(event, cb);
+    return this;
+  }
+  off(event: "recovered" | "expired", cb: (entry: PendingDecision) => void): this {
+    this.emitter.off(event, cb);
+    return this;
+  }
+}
+```
+
+解耦 `EventEmitter` 的类型系统, 避免编译期签名冲突。
+
+---
+
+## 13. 总结
 
 notify-bridge 在**单用户 + 单人开发机**场景下是一个完整可用的 Human-in-the-Loop 方案。架构设计上采用 Promise 阻塞模式让工具调用自然地挂起 Agent 执行，适配器模式让 IM 平台可插拔。
 
