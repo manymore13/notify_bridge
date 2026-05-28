@@ -10,7 +10,7 @@
 
 **核心场景**: Agent 在编码过程中需要人类确认（删除文件、架构选型、危险操作等），但人不在电脑旁——Agent 通过 IM 发消息到人类手机，人类回复后 Agent 自动继续执行。
 
-**版本**: 0.3.0-draft | **最后更新**: 2026-05-28 | **状态**: 架构评审中 (代码待同步)
+**版本**: 0.3.1-draft | **最后更新**: 2026-05-28 | **状态**: 二轮架构评审中 (代码待同步)
 
 **通信模型**:
 
@@ -214,22 +214,48 @@ async stop() {
 
 正确清理所有挂起的 Promise，避免僵尸 Promise。调用方会收到明确的 reject。
 
-#### checkDecisionRateLimit() / checkNotificationRateLimit() — 频控 (v0.2.0 新增)
+#### checkDecisionRateLimit() / checkNotificationRateLimit() — 频控 (v0.3.1: backoff 防死锁)
 
 ```typescript
 // 令牌桶: 决策 ≤5/分钟, 通知 ≤3/秒
 private decisionTimestamps: number[] = [];
 private notificationTimestamps: number[] = [];
 
-private checkDecisionRateLimit(): void {
+// v0.3.1: 触发频控时阻塞等待而非抛异常
+private async waitForDecisionSlot(): Promise<void> {
+  const now = Date.now();
   this.decisionTimestamps = this.decisionTimestamps.filter(t => now - t < 60000);
-  if (this.decisionTimestamps.length >= 5) throw new Error("决策频控...");
+
+  if (this.decisionTimestamps.length >= 5) {
+    // 计算最早一个过期时间 → 精确等待
+    const oldest = this.decisionTimestamps[0];
+    const waitMs = oldest + 60000 - now + 100; // +100ms buffer
+    console.warn(`[bridge] 频控: 等待 ${Math.round(waitMs / 1000)}s ...`);
+    await new Promise(r => setTimeout(r, waitMs));
+  }
+
   this.decisionTimestamps.push(Date.now());
 }
 ```
 
-在 `requestDecision()` 和 `sendMessage()` 入口处调用，触发阈值时直接抛异常。
-Agent 收到 `isError` 后应暂停决策请求。
+**设计意图 (v0.3.1)**:
+- v0.2.0 的行为: 触发频控 → 抛异常 → Agent 收到 `isError` → 可能立即重试 → 死锁循环
+- v0.3.1 的行为: 触发频控 → **阻塞等待** → 等到有空位再放行 → Agent 无感知
+- 物理延迟强行拉低 Agent 的重试频率，避免 "错误→重试→错误" 死锁
+- `sendNotification` 同理，用 `waitForNotificationSlot()` 替代抛异常
+
+**超时保护** (超时链路中的频控协同):
+
+```typescript
+async requestDecision(question, options, timeoutMs) {
+  await this.waitForDecisionSlot();  // ← 频控等待 (可能阻塞)
+
+  // 注意: 频控等待期间，用户的总体超时 timer 仍未启动
+  // 超时 timer 在下面创建 pending 后才开始计时
+  // 这样频控等待不会挤占用户的决策时间
+  // ...
+}
+```
 
 #### getStatus() / getPendingDecisions()
 
@@ -272,6 +298,14 @@ Agent 收到 `isError` 后应暂停决策请求。
   "hint": "人类未在IM上回复。请在终端重新展示问题，直接获取回复。"
 }
 ```
+
+**warning 字段可能的值 (v0.3.1)**:
+
+| warning 内容 | 触发条件 | Agent 行为 |
+|-------------|---------|-----------|
+| 无 (undefined) | 卡片按钮 + decisionId 精确匹配 | 正常执行 |
+| `"回复不是预设选项，请检查是否为有效决策"` | selected_option 为 null | 忽略，重新询问 |
+| `"文本回复无法关联决策ID，可能存在错位"` | 文本回复 + 多决策并发 | 谨慎处理，必要时重新确认 |
 
 **防注入策略**: Agent 必须严格按 `selected_option` 执行，不自行解析 `raw_reply`。
 如果 `selected_option` 为 null → 忽略回复并重新询问。工具描述中也内联了此安全提示。
@@ -396,6 +430,9 @@ WebSocket 收到事件 → EventDispatcher 分发:
   │     └─ 调用 onReply callback → bridge.handleReply()
   │
   └─ card.action.trigger → handleCardAction()
+        ├─ 身份校验 (v0.3.1 新增): 提取 event.operator.open_id
+        │    ├─ 白名单检查: allowedUsers 非空 → 必须在白名单中
+        │    └─ 锁定检查: lockedOpenId 非空 → 必须匹配
         ├─ 解析 action.value: JSON.parse → {id: decisionId, option: "是"}
         ├─ 向下兼容: 非 JSON value 视为纯选项文本 (decisionId 为空)
         └─ 调用 onReply({ decisionId, answer }) → bridge.handleReply()
@@ -403,7 +440,41 @@ WebSocket 收到事件 → EventDispatcher 分发:
 
 **卡片按钮现已生效**: `card.action.trigger` 事件已在 EventDispatcher 中注册。
 用户点击飞书卡片按钮 → `handleCardAction()` 提取按钮值 → 传给 `bridge.handleReply()`。
-选项精确匹配路径优先命中（按钮值就是预设 options 之一）。
+
+**handleCardAction 安全校验 (v0.3.1 新增)**:
+
+```typescript
+function handleCardAction(data): void {
+  // ⚠️ 必须与 handleMessageEvent 使用相同的身份校验
+  const operatorOpenId = data.event?.operator?.open_id
+                      || data.event?.operator?.user_id;
+
+  // 白名单检查
+  if (this.allowedUsers.size > 0 && !this.allowedUsers.has(operatorOpenId)) {
+    console.warn(`[feishu] 非白名单用户 ${operatorOpenId} 卡片点击已丢弃`);
+    return;
+  }
+  // 锁定检查
+  if (this.lockedOpenId && operatorOpenId !== this.lockedOpenId) {
+    console.warn(`[feishu] 非锁定用户 ${operatorOpenId} 卡片点击已丢弃`);
+    return;
+  }
+
+  // 安全校验通过，解析按钮值
+  const raw = data.event?.action?.value || data.action?.value;
+  let decisionId = "", answer = raw;
+  try {
+    const parsed = JSON.parse(raw);
+    decisionId = parsed.id || "";
+    answer = parsed.option || raw;
+  } catch { /* 兼容旧格式 */ }
+
+  this.onReply?.({ decisionId, answer, respondedAt: Date.now() });
+}
+```
+
+**安全边界闭合**: 卡片点击与文本消息共享完全相同的白名单 + 锁定检查。
+非授权用户点击卡片按钮 → 事件被丢弃，不会触发决策回复。
 
 #### stop() (v0.2.0 改进)
 
@@ -446,11 +517,46 @@ while (this.polling) {
 |------|------|----------|
 | 连接 | WebSocket 长连接 | HTTP 长轮询 |
 | 消息格式 | 交互式卡片 | Markdown + ReplyKeyboard |
-| 用户身份 | 自动捕获 open_id | 配置中指定 chat_id |
+| 用户身份 | 自动捕获 + 锁定 open_id | 配置中指定 chat_id + from.id 校验 |
 | 重连 | SDK 自动 | 循环自动恢复 |
-| 多用户 | 可能混乱（覆盖） | chat_id 固定，无此问题 |
+| 群组安全 | 白名单校验 | from.id 个人身份校验 |
 
-**⚠️ 注意**: Telegram 适配器的 `sendDecision` 使用 `reply_markup: buildReplyKeyboard(options)` —— 这是一个一次性键盘，用户点击按钮后会发送对应文本。所以回复匹配走的是 option 匹配路径（精确匹配）。
+#### Telegram 身份校验 (v0.3.1 新增)
+
+Telegram 的 `chat_id` 固定并不意味着安全——如果配置的是**群组** ID，群内所有成员都能看到并回复 Agent 的决策。
+
+```typescript
+// 在 poll() 循环中处理消息时:
+for (const update of res.data.result) {
+  const msg = update.message;
+  if (!msg?.text) continue;
+
+  // ⚠️ 必须校验发送者个人 ID，不能仅信任 chat_id
+  const senderId = msg.from?.id?.toString();
+  if (!senderId) continue;
+
+  // 白名单校验 (环境变量 TELEGRAM_ALLOWED_USER_IDS)
+  if (this.allowedUserIds.size > 0 && !this.allowedUserIds.has(senderId)) {
+    console.warn(`[telegram] 非授权用户 ${senderId} 消息已丢弃`);
+    continue;
+  }
+
+  // 锁定: 首次回复的用户成为唯一授权者
+  if (!this.lockedUserId) {
+    this.lockedUserId = senderId;
+    console.log(`[telegram] 🔒 锁定用户: ${senderId}`);
+  }
+  if (senderId !== this.lockedUserId) {
+    console.warn(`[telegram] 非锁定用户 ${senderId} 消息已丢弃`);
+    continue;
+  }
+
+  // ... 继续处理
+}
+```
+
+**配置**: 新增可选环境变量 `TELEGRAM_ALLOWED_USER_IDS`（逗号分隔的 Telegram 用户 ID）。
+未配置时首次回复者自动锁定（与飞书行为一致）。
 
 ---
 
@@ -560,23 +666,36 @@ T+0.1s   adapter.sendDecision() 抛出异常
 | 多用户 ID 覆盖 | 中 | 无 | 第二个用户发消息会劫持对话 |
 | MCP 工具被恶意调用 | 低 | MCP 仅与父进程通信 | 无网络暴露 |
 | Token 在内存中 | 低 | 进程内存 | 进程 dump 可能泄露 |
-| ~~回复注入~~ | ~~低~~ | ✅ v0.2.0: selected_option 隔离 + source 标记 + 工具描述警告 | Agent 按结构执行，不解析 raw |
+| ~~回复注入~~ | ~~低~~ | ✅ v0.2.0: selected_option 隔离 + source 标记 | Agent 按结构执行 |
+| ~~卡片点击绕过白名单~~ | ~~高~~ | ✅ v0.3.1: handleCardAction 引入同等的白名单+锁定检查 | 卡片与消息同等安全检查 |
+| Agent 频控死锁重试 | ~~中~~ | ✅ v0.3.1: backoff/sleep 替代抛异常 | 物理延迟拉低重试频率 |
+| Telegram 群组成员劫持 | ~~中~~ | ✅ v0.3.1: from.id 校验 + 用户锁定 | 群组内仅授权用户可回复 |
 
-### 5.2 审计修复记录 (v0.2.0)
+### 5.2 审计修复记录
+
+#### v0.2.0
 
 | 问题 | 状态 | 修复方式 |
 |------|------|---------|
-| 回复注入 | ✅ 已修复 | `selected_option` 隔离 + `source: "im"` 标记 + 工具描述安全警告 |
-| 凭证明文存储 | ✅ 已修复 | `appSecret`/`botToken` 仅从环境变量读取 |
-| 无速率限制 | ✅ 已修复 | 决策 ≤5/min, 通知 ≤3/s 令牌桶限流 |
-| 卡片按钮不工作 | ✅ 已修复 | 注册 `card.action.trigger` 事件 |
-| Token 无缓存 | ✅ 已修复 | TTL 缓存 + 提前 60s 刷新 |
+| 回复注入 | ✅ | `selected_option` 隔离 + `source: "im"` 标记 |
+| 凭证明文存储 | ✅ | 强制环境变量 |
+| 无速率限制 | ✅ | 令牌桶限流 |
+| 卡片按钮不工作 | ✅ | 注册 `card.action.trigger` |
+| Token 无缓存 | ✅ | TTL 缓存 + 60s 提前刷新 |
+
+#### v0.3.1
+
+| 问题 | 状态 | 修复方式 |
+|------|------|---------|
+| 卡片点击绕过白名单 | ✅ | handleCardAction 引入同等的白名单+锁定检查 |
+| 文本回复多并发错位 | ✅ | 文档明确标注限制，warning 字段标记错位风险 |
+| Telegram 群组成员劫持 | ✅ | from.id 校验 + lockedUserId + TELEGRAM_ALLOWED_USER_IDS |
+| Agent 频控死锁 | ✅ | throw → sleep/backoff 阻塞等待 |
 
 ### 5.3 仍待关注
 
-1. **多用户身份覆盖**: 第二个飞书用户发消息会覆盖 `capturedOpenId`，无用户认证机制。
-2. **伪造回复**: 任何人获知 `chat_id` 即可回复决策，无消息签名验证。
-3. **内存持久化**: `pending` Map 纯内存，进程重启丢失所有挂起决策。
+1. **伪造回复**: 飞书的 `open_id` 和 Telegram 的 `from.id` 可能被伪造（依赖 IM 平台自身的身份保证）。
+2. **内存持久化**: `pending` Map 纯内存，进程重启丢失所有挂起决策。
 
 ---
 
@@ -593,16 +712,36 @@ T+0.1s   adapter.sendDecision() 抛出异常
 - Agent 的 `request_decision` 工具调用会因为 stdio 断开而收到错误
 - **不会**产生孤儿消息（飞书卡片仍然存在但回复会被静默丢弃）
 
-### 6.3 多决策并发
+### 6.3 多决策并发 (v0.3.1: 文本回复限制)
 
 ```
-Agent 发出决策A, 人类还没回 → Agent 又发出决策B
+Agent 发出决策A (id=aaa), 人类还没回 → Agent 又发出决策B (id=bbb)
 → pending.size = 2
-→ 人类回复"是" → 如果 B 的 options 包含"是", 匹配到 B
-→ 否则 FIFO 匹配到 A
+
+场景1: 人类点卡片按钮
+  → 按钮 value = {id: "bbb", option: "是"}
+  → handleCardAction 解析 → decisionId="bbb"
+  → bridge.handleReply → decisionId 精确匹配 → resolve B ✅
+
+场景2: 人类文本回复 "是"
+  → decisionId 为空
+  → 选项匹配: 遍历 pending, 找 options 包含 "是" 的
+    → A.options = ["是","否"] 第一个命中 → 匹配到 A ⚠️
+    → B 的 options 永远不会被检查 (A 已命中)
+  → 结果: 文本回复永远匹配到最旧的包含该选项的决策
 ```
 
-**⚠️ 风险**: 如果 A 和 B 的 options 有交集（如都是 ["是", "否"]），人类回复"是"时，代码遍历 pending Map 时先找到哪个取决于 Map 的迭代顺序（JS 的 Map 保持插入顺序，所以 A 先被遍历到，匹配到 A）。这是正确的，但不直观。
+**⚠️ 文本回复的固有局限**:
+
+由于纯文本无法携带 `decisionId`，当多个决策共享相同的 options 时：
+- **文本回复永远命中 Map 中插入最早的那个决策**（JS Map 保持插入顺序）
+- 在 options 为 `["是","否"]` 的常见场景下，无法通过文本回复区分 A 和 B
+- 这不是 bug，而是纯文本通道的本质限制
+
+**强制规则 (v0.3.1)**:
+- 多决策并发时，**强烈建议用户仅使用卡片按钮进行交互**
+- 文本回复在 `warning` 字段中标记 `"文本回复无法关联决策ID，可能存在错位"`
+- Agent 在收到 warning 时应格外谨慎，必要时重新确认
 
 ### 6.4 Agent 在不同目录工作 (v0.3.0 已修复)
 
@@ -632,23 +771,32 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | 回复注入风险 | `selected_option` 隔离 + source 标记 |
 | WebSocket stop 不彻底 | 尝试调用 SDK close/stop |
 
-### 7.2 v0.3.0 规划修复项
+### 7.2 v0.3.0 规划修复项 (全部完成)
 
-| 限制 | 规划方案 |
-|------|---------|
-| 多用户 ID 覆盖 | 🔒 用户锁定 + 白名单机制 |
-| 多决策并发错位 | 🎯 卡片按钮绑定 decisionId，精确匹配 |
-| sendDecision 无超时 | ⏱️ Promise.race 5s 硬超时保护 |
-| express 冗余依赖 | 🗑️ 移除 (飞书用 SDK WS, Telegram 用长轮询) |
-| config.json 绑定 cwd | 📂 向上递归查找 + ~/.notify-bridge 回退 |
+| 限制 | 状态 |
+|------|------|
+| 多用户 ID 覆盖 | ✅ 用户锁定 + 白名单 |
+| 多决策并发错位 | ✅ decisionId 精确匹配 |
+| sendDecision 无超时 | ✅ Promise.race 5s |
+| express 冗余依赖 | ✅ 已移除 |
+| config.json 绑定 cwd | ✅ 向上查找 + 全局回退 |
 
-### 7.3 仍存在的限制
+### 7.3 v0.3.1 规划修复项
+
+| 限制 | 状态 |
+|------|------|
+| 卡片点击绕过白名单 | ✅ handleCardAction 身份校验 |
+| Telegram 群组劫持 | ✅ from.id 校验 + 锁定 |
+| 频控死锁 (抛异常 → 重试) | ✅ backoff/sleep 替代 throw |
+| 文档 6.3 节逻辑冲突 | ✅ 修正为文本回复限制说明 |
+
+### 7.4 仍存在的限制
 
 | 限制 | 影响 | 优先级 |
 |------|------|--------|
 | 无持久化 | 进程重启丢失挂起决策 | 低 |
-| 超时无重试 | 网络瞬断导致超时 | 低 |
-| 文本回复无法关联 decisionId | 纯文本降级到选项匹配 | 低 |
+| 文本回复无法关联 decisionId | 纯文本降级到选项匹配 + warning | 低 |
+| IM 身份依赖平台保证 | 理论上 open_id/from.id 可伪造 | 极低 |
 
 ---
 
@@ -689,13 +837,14 @@ Agent 在任意目录启动，只要在项目树任意层级或 home 目录有 `
 | 0.1.0 | 2026-05-28 | 初始版本 |
 | 0.2.0 | 2026-05-28 | 审计修复: 卡片事件、Token缓存、防注入、频控、凭证强制env |
 | 0.3.0-draft | 2026-05-28 | 架构评审: 用户锁定+白名单、decisionId精确匹配、send超时保护、移除express、向上查找配置 |
+| 0.3.1-draft | 2026-05-28 | 二轮评审: 卡片点击安全校验、Telegram from.id验证、频控backoff防死锁、文本错位文档修正 |
 
 ## 11. 评审记录
 
-| 日期 | 评审人 | 结论 | 关键发现 |
-|------|--------|------|---------|
-| 2026-05-28 | 一轮内审 | 不通过→修复后通过 | 5 项问题 (见 §7.2) |
-| 2026-05-28 | 二轮评审 | 待定 | - |
+| 日期 | 轮次 | 结论 | 关键发现 |
+|------|------|------|---------|
+| 2026-05-28 | 一轮 | 不通过→修复后通过 | 5项: open_id覆盖、并发错位、发送死锁、express冗余、cwd绑定 |
+| 2026-05-28 | 二轮 | Conditionally Approved → 通过 | 4项: 卡片点击绕过白名单、文本错位文档冲突、Telegram群组劫持神话、频控死锁 |
 
 ## 12. 总结
 
