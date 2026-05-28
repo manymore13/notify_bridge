@@ -190,19 +190,16 @@ export class FeishuAdapter implements IMBotAdapter {
 
   private handleCardAction(evt: any): void {
     try {
-      const operatorOpenId = evt.operatorId || evt.operator?.open_id;
+      // createLarkChannel 的 cardAction 事件: operator 在 evt.operator.openId
+      const operatorOpenId = evt.operator?.openId || evt.operator?.open_id;
       if (!this.gateIncoming(operatorOpenId)) return;
 
-      const raw = evt.action?.value ?? "";
-      let decisionId = "";
-      let answer = raw;
-      try {
-        const parsed = JSON.parse(raw);
-        decisionId = parsed.id || "";
-        answer = parsed.option || raw;
-      } catch {}
+      // SDK 已自动解析 action.value 为对象 (非字符串!)
+      const value = evt.action?.value;
+      const answer = (typeof value === "object" && value?.option) ? value.option : String(value ?? "");
+      const decisionId = (typeof value === "object" && value?.id) ? value.id : "";
 
-      console.error(`[feishu] 🃏 卡片: "${answer}"`);
+      console.error(`[feishu] 🃏 卡片按钮: "${answer}" (decisionId: ${decisionId.slice(0, 8)})`);
       this.onReply?.({ decisionId, answer, respondedAt: Date.now() })
         ?.catch((err) => console.error(`[feishu] onReply 异常: ${err.message}`));
     } catch (err: any) {
