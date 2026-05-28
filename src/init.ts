@@ -190,6 +190,39 @@ export async function runInit() {
   const isGlobal = mcpScope !== "2";
   saveMcpConfig(appSecret, isGlobal);
 
+  // 6. Inject agent rules
+  console.log("\n📝 Agent 规则:");
+  console.log("  1. 轻量规则 (仅危险操作+通知) → 回车");
+  console.log("  2. 不注入规则");
+  const rulesChoice = await ask("请选择", "1");
+  if (rulesChoice !== "2") {
+    const rulesContent = `# notify-bridge 决策规则
+
+## 必须通过飞书通知的场景
+- 删除文件、git push/force push、git reset --hard 等不可逆操作
+- 架构选型、库替换等需要我决策的事项
+- 长时间任务（>30秒）完成后发送通知
+
+调用方式: request_decision("问题", ["选项1","选项2"]) 或 send_notification("通知内容")
+`;
+    const claudeMdPath = isGlobal
+      ? join(homedir(), ".claude", "CLAUDE.md")
+      : join(process.cwd(), "CLAUDE.md");
+    const mdDir = join(claudeMdPath, "..");
+    if (!existsSync(mdDir)) mkdirSync(mdDir, { recursive: true });
+    // 追加而非覆盖
+    let existingMd = "";
+    if (existsSync(claudeMdPath)) {
+      try { existingMd = readFileSync(claudeMdPath, "utf-8"); } catch {}
+    }
+    if (!existingMd.includes("notify-bridge")) {
+      writeFileSync(claudeMdPath, (existingMd ? existingMd + "\n\n" : "") + rulesContent);
+      console.log(`✅ Agent 规则已写入: ${claudeMdPath}`);
+    } else {
+      console.log(`✅ Agent 规则已存在: ${claudeMdPath}`);
+    }
+  }
+
   console.log("\n🎉 完成! 重启 Claude Code 后生效。\n");
   rl.close();
 }
