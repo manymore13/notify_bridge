@@ -7,6 +7,9 @@ interface SetupOptions {
 }
 
 export async function runSetup(opts: SetupOptions) {
+  if (!process.env.FEISHU_APP_SECRET) {
+    console.warn("⚠️  FEISHU_APP_SECRET 环境变量未设置, 请在启动前设置或手动配置 env 字段");
+  }
   if (opts.global) {
     setupGlobal();
   } else {
@@ -66,18 +69,23 @@ function setupProject() {
   addEntry(configPath, {
     command: "notify-bridge",
     args: [],
-    cwd: projectRoot,
+    env: process.env.FEISHU_APP_SECRET
+      ? { FEISHU_APP_SECRET: process.env.FEISHU_APP_SECRET }
+      : undefined,
   });
 }
 
 function setupGlobal() {
-  const configPath = join(homedir(), ".claude", "settings.json");
+  const configPath = join(homedir(), ".claude.json");
 
   console.log(`全局配置 (所有项目生效)`);
-  console.log(`文件: ~/.claude/settings.json`);
+  console.log(`文件: ~/.claude.json`);
 
   addEntry(configPath, {
     command: "notify-bridge",
     args: [],
+    env: process.env.FEISHU_APP_SECRET
+      ? { FEISHU_APP_SECRET: process.env.FEISHU_APP_SECRET }
+      : undefined,
   });
 }
