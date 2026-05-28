@@ -44,7 +44,12 @@ function addEntry(configPath: string, entry: any) {
   }
 
   const existed = "notify-bridge" in config.mcpServers;
-  config.mcpServers["notify-bridge"] = entry;
+  // 保留已有的 env 字段 (只新增/更新 command + args)
+  const prev = existed ? config.mcpServers["notify-bridge"] : {};
+  config.mcpServers["notify-bridge"] = {
+    ...entry,
+    env: entry.env || prev.env,  // 新 env 优先，否则保留旧的
+  };
 
   writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
 
